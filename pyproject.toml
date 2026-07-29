@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rangecontrol"
+version = "0.1.0"
+description = "Discord change-request advisor for cyber security range exercises"
+requires-python = ">=3.11"
+dependencies = [
+    "discord.py>=2.3",
+    "anthropic>=0.40",
+    "google-genai>=1.0",
+    "pypdf>=4.0",
+    "openpyxl>=3.1",
+    "python-docx>=1.1",
+    "python-dotenv>=1.0",
+    # Load-bearing for the frozen binary: the Linux build runs in Debian
+    # bookworm, so its OpenSSL looks for CAs at Debian paths that do not
+    # exist on Fedora/RHEL/Arch. certifi is the fallback store.
+    "certifi>=2024.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "pytest-cov>=5.0"]
+
+[project.scripts]
+rangecontrol = "rangecontrol.main:main"
+
+[tool.setuptools.packages.find]
+include = ["rangecontrol*"]
+
+[tool.setuptools.package-data]
+rangecontrol = ["RangeTemplate.md", "PREGENERATE.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+pythonpath = ["."]
+filterwarnings = [
+    "error",
+    # Upstream: google-genai trips a CPython 3.14 deprecation at import time.
+    # Narrowly ignored so our own warnings stay visible and fatal.
+    "ignore:'_UnionGenericAlias' is deprecated:DeprecationWarning",
+]
+
+[tool.coverage.run]
+source = ["rangecontrol"]
+
+[tool.coverage.report]
+fail_under = 80

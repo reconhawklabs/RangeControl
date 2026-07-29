@@ -1,0 +1,33 @@
+# Secrets and runtime state
+.env
+.env.*
+!.env.example
+.rangecontrol/
+
+# Range scenario material — must never be committed
+Range.md
+resources/
+
+# Leak regression suite fixtures (task 23): deliberately fake range material,
+# safe to commit. Scoped narrowly so real Range.md/resources/ anywhere else
+# stay blocked.
+!/tests/fixtures/range/Range.md
+!/tests/fixtures/range/resources/
+!/tests/fixtures/range/resources/topology.txt
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# SDD scratch workspace
+.superpowers/
+
+# PyInstaller outputs (packaging/ holds the committed build assets)
+build/
+dist/

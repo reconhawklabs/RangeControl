@@ -1,0 +1,4 @@
+Server segment 10.77.0.0/16 hosts DC-VULCAN (domain controller) and
+SVC-FORGE (build server). Service account svc-vulcan-backup runs the nightly
+job. Red team staging is at 203.0.113.44; the callback path from SVC-FORGE to
+that address must remain open for MSEL-INJECT-ALPHA.
