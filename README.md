@@ -8,9 +8,6 @@ using full knowledge of the range, without revealing any of it.
 Put the executable in its own folder and run it. It creates `.env`,
 `resources/`, and `PREGENERATE.md` next to itself and opens a window.
 
-On Windows, SmartScreen warns because the binary is unsigned. Click **More
-info**, then **Run anyway**.
-
 ## 2. Create the Discord bot
 
 In the [Discord Developer Portal](https://discord.com/developers/applications):
