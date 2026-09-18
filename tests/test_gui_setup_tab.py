@@ -243,8 +243,9 @@ def test_column_split_handles_seven_fields_without_dropping_or_overlapping(monke
         placements = []
         for field in fields:
             cell = widget._entries[field.key].master
-            info = cell.grid_info()
-            placements.append((int(info["column"]), int(info["row"])))
+            column_frame = cell.master  # each column is its own grid
+            column = int(column_frame.grid_info()["column"])
+            placements.append((column, int(cell.grid_info()["row"])))
 
         assert len(placements) == 7  # nothing dropped
         assert len(set(placements)) == 7  # nothing overlapping
@@ -459,7 +460,8 @@ def test_a_very_narrow_column_still_leaves_a_readable_width(tab):
 
 def test_the_two_columns_are_declared_uniform(tab):
     """uniform= keeps them equal, so neither can starve the other."""
-    grid = tab.entry_for("DISCORD_BOT_TOKEN").master.master
+    # cell -> column frame -> the two-column grid
+    grid = tab.entry_for("DISCORD_BOT_TOKEN").master.master.master
     left = grid.columnconfigure(0)
     right = grid.columnconfigure(1)
     assert left["uniform"] == right["uniform"] != ""
@@ -487,3 +489,61 @@ def test_refresh_sits_after_open_resources_and_is_named_for_what_it_does(tab):
             open_col = int(child.grid_info()["column"])
     assert open_col is not None, "Open resources folder button not found"
     assert int(tab.refresh_button.grid_info()["column"]) > open_col
+
+
+def test_denied_reply_shows_the_default_when_blank(tab):
+    """A blank field would send a blank denial; the operator should see the
+    text that will actually go out and edit from there."""
+    from rangecontrol.config import DEFAULT_HITL_DENIED_TEXT
+
+    tab.set_values({})
+    assert tab.values()["HITL_DENIED_TEXT"] == DEFAULT_HITL_DENIED_TEXT
+    tab.set_values({"HITL_DENIED_TEXT": "Custom no."})
+    assert tab.values()["HITL_DENIED_TEXT"] == "Custom no."
+
+
+def test_credentials_sit_left_and_discord_settings_right(tab):
+    """The white cell ID belongs with the other Discord settings, directly
+    above Allowed channels, and the left column holds only the four
+    provider and token fields so nothing pads them apart."""
+    def placement(key):
+        cell = tab.entry_for(key).master
+        return int(cell.master.grid_info()["column"]), int(cell.grid_info()["row"])
+
+    assert [placement(k)[0] for k in ("LLM_PROVIDER", "LLM_MODEL", "LLM_API_KEY", "DISCORD_BOT_TOKEN")] == [0, 0, 0, 0]
+    assert placement("WHITE_CELL_CHANNEL_ID") == (1, 0)
+    assert placement("ALLOWED_CHANNEL_IDS") == (1, 1)
+    assert placement("HITL_DENIED_TEXT")[0] == 1
+
+
+def test_left_column_rows_are_not_stretched_by_the_right_column(tab):
+    """A tall text box on the right must not open a gap under a one-line
+    entry on the left: the columns lay out independently."""
+    tab.update_idletasks()
+    key_cell = tab.entry_for("LLM_API_KEY").master
+    token_cell = tab.entry_for("DISCORD_BOT_TOKEN").master
+    gap = token_cell.winfo_y() - (key_cell.winfo_y() + key_cell.winfo_reqheight())
+    assert gap <= 2
+
+
+def test_denied_reply_has_no_hint_text(tab):
+    cell = tab.entry_for("HITL_DENIED_TEXT").master
+    labels = [c.cget("text") for c in cell.winfo_children() if c.winfo_class() == "TLabel"]
+    assert labels == ["Reply when the white cell denies"]
+
+
+def test_denied_reply_is_editable_only_with_human_in_the_loop(tab):
+    """The message is never sent unless rulings are held, so the box is
+    disabled until the checkbox is ticked, and re-enabled live."""
+    widget = tab.entry_for("HITL_DENIED_TEXT")
+    tab.set_values({"HUMAN_IN_THE_LOOP": "false"})
+    assert str(widget.cget("state")) == "disabled"
+    # A load still lands in the disabled box, and values() still reads it.
+    from rangecontrol.config import DEFAULT_HITL_DENIED_TEXT
+
+    assert tab.values()["HITL_DENIED_TEXT"] == DEFAULT_HITL_DENIED_TEXT
+
+    tab._vars["HUMAN_IN_THE_LOOP"].set("true")
+    assert str(widget.cget("state")) == "normal"
+    tab._vars["HUMAN_IN_THE_LOOP"].set("false")
+    assert str(widget.cget("state")) == "disabled"

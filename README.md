@@ -27,13 +27,24 @@ https://discord.com/api/oauth2/authorize?client_id=YOUR_APP_ID&scope=bot%20appli
 For channel IDs, turn on **Settings > Advanced > Developer Mode**, then
 right-click a channel and **Copy Channel ID**.
 
+The white cell channel is private, so the invite alone does not let the bot
+in. Give the bot a role that can see that channel, or add the bot itself
+under the channel's permissions. It needs View Channel, Send Messages, Embed
+Links, Add Reactions, and Read Message History there. The same applies to
+any private channel you list under Allowed channels. When the bot starts it
+checks every configured channel and says exactly what is missing.
+
 ## 3. Fill in the Setup tab
 
 Provider, model, API key, Discord bot token, and the white cell channel ID.
 That channel must be private: every ruling posts there with the real reason
-behind it.
+behind it. **Fetch** next to the model field lists what your API key can
+reach; it needs only the provider and the key.
 
 Everything saves automatically. Each field says what it expects underneath it.
+The human-in-the-loop checkbox and the denial reply apply to a running bot
+immediately. Every other field is read when the bot starts, and the status
+bar says so if you change one while it runs.
 
 ## 4. Add your range material
 
@@ -41,8 +52,17 @@ Put it in `resources/`. Subfolders are fine. Network diagrams, MSELs, inject
 lists, firewall exports, asset inventories, accounts, scripts, scoring
 requirements, red team plans, anything that must not be touched.
 
-Supported: `.txt` `.md` `.json` `.yaml` `.conf` `.ini` `.log` `.xml` `.rules`
-`.pdf` `.docx` `.xlsx` `.csv` `.tsv` `.png` `.jpg` `.gif` `.bmp` `.webp`
+Supported: text and config files (`.txt` `.md` `.json` `.yaml` `.toml`
+`.conf` `.ini` `.log` `.xml` `.rules` `.html` `.sql` `.nmap` and more),
+scripts (`.ps1` `.sh` `.bat` `.py` and other source files), `.pdf` `.docx`
+`.pptx` `.xlsx` `.csv` `.tsv`, and images (`.png` `.jpg` `.gif` `.bmp`
+`.webp` `.tiff`). Anything else is scanned for readable text.
+
+Diagrams and screenshots go through the AI's vision, including pictures
+embedded in PDF, Word, and PowerPoint files (up to 25 per file; icons are
+skipped). Oversized images are scaled down rather than refused. A file that
+is too large to include whole is cut at its beginning and named in the
+ingest report.
 
 Click **Refresh Resources**, then **Generate**. This reads everything through
 the AI and writes `Range.md`. It takes a few minutes and costs API calls.
@@ -80,7 +100,10 @@ Tick the checkbox, no restart needed. Every **ruling** is then held:
 
 * White cell gets AWAITING REVIEW with ✅ and ❌ reactions.
 * The asker gets "Logged with the change board, I'll come back to you shortly."
-* ✅ sends the real answer. ❌ sends "denied to retain range integrity."
+* ✅ sends the real answer. ❌ sends the denial reply, which defaults to
+  "That request has been denied to retain range integrity." and can be
+  reworded in the Setup tab. Keep it generic: it must not hint at what the
+  change would have touched.
 
 Only rulings are held. If the white cell embed says `Outcome: clarify` instead
 of `Verdict:`, the bot never made a ruling, so there was nothing to approve.
@@ -105,7 +128,11 @@ after changing it.
 |---|---|
 | "Improper token has been passed" | Used the Application ID or Client Secret. Use **Reset Token**. |
 | Ignores `@mentions` | Message Content Intent is off. |
+| "White cell channel ... unusable" at startup | The message names the cause: a wrong ID, a private channel the bot has no role for, or a listed permission it lacks. Fix it, then restart. |
 | Nothing in the white cell channel | Wrong channel ID, or the bot cannot see it. Status bar turns red. |
+| "I can't process that right now" on every ruling | Open the white cell embed's Error field. A `refusal` with a category means the model's safety layer declined the range material; the bot retries on Anthropic's fallback model automatically, and the Console shows when that happened. Anything else names the API problem (bad key, prompt too long). |
+| A file shows as unreadable | The reason says why: password-protected Office files and rights-managed PDFs need an unprotected copy; scanned PDFs need their pages exported as images. |
+| `/rc` says the channel isn't enabled | That channel is not in Allowed channels. |
 | Generate is dull | `resources/` is empty, or the bot is running. |
 | Start Bot is dull | A required field is blank, or no `Range.md` yet. |
 

@@ -1,6 +1,10 @@
 import json
 import logging
+import threading
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
+
+import discord
 
 import pytest
 
@@ -8,6 +12,7 @@ from rangecontrol.advisor.engine import Advisor
 from rangecontrol.advisor.models import GateVerdict
 from rangecontrol.advisor.prompts import ERROR_TEXT
 from rangecontrol.audit.log import AuditLog
+from rangecontrol.bot.diagnostics import WHITE_CELL_PERMISSIONS
 from rangecontrol.bot.client import (
     HELD_TEXT,
     RATE_LIMIT_TEXT,
@@ -18,7 +23,7 @@ from rangecontrol.bot.client import (
 from rangecontrol.bot.mode import ModeSwitch
 from rangecontrol.bot.pending import PendingRegistry
 from rangecontrol.bot.ratelimit import RateLimiter
-from rangecontrol.config import load_config
+from rangecontrol.config import DEFAULT_HITL_DENIED_TEXT, load_config
 from tests.support.stub_provider import StubProvider
 
 BASE_ENV = {
@@ -41,6 +46,7 @@ class FakeBot:
         self.audit = audit
         self.limiter = limiter
         self.mode = ModeSwitch(False)
+        self.denied_text = DEFAULT_HITL_DENIED_TEXT
         self.pending = PendingRegistry()
         self.white_cell_posts = []
         self.sent = []
@@ -272,37 +278,95 @@ async def test_hitl_fail_open_is_not_marked_held_and_reports_an_error(tmp_path):
     assert "no review" in bot.errors[0].lower()
 
 
-async def test_setup_hook_reports_an_error_when_the_white_cell_is_unreachable(tmp_path):
+def _forbidden():
+    return discord.Forbidden(SimpleNamespace(status=403, reason="Forbidden"), "x")
+
+
+def _text_channel(name="white-cell", **denied):
+    granted = {flag: True for flag in WHITE_CELL_PERMISSIONS}
+    granted.update(denied)
+    perms = SimpleNamespace(**granted)
+    return SimpleNamespace(
+        id=12345, name=name, guild=SimpleNamespace(name="Range", me=object()),
+        permissions_for=lambda member: perms,
+    )
+
+
+async def test_ready_reports_an_error_when_the_white_cell_is_unreachable(tmp_path):
     """The white-cell-unreachable condition must reach the ERROR wire, not
-    only the logger.error banner that scrolls off the console feed."""
+    only the logger.error banner that scrolls off the console feed -- and it
+    must say why, so the operator can fix the right thing."""
     errors = []
     bot = RangeControlBot(
         config_for(tmp_path), advisor=object(), audit=AuditLog(tmp_path),
         on_error=errors.append,
     )
-    bot.tree.sync = AsyncMock()
     bot.get_channel = lambda channel_id: None
-    bot.fetch_channel = AsyncMock(side_effect=RuntimeError("missing access"))
+    bot.fetch_channel = AsyncMock(side_effect=_forbidden())
 
-    await bot.setup_hook()  # must not raise -- startup proceeds regardless
+    await bot.on_ready()  # must not raise -- startup proceeds regardless
 
     assert errors
     assert "12345" in errors[0]
+    assert "cannot see" in errors[0]
 
 
-async def test_setup_hook_reports_nothing_when_the_white_cell_resolves(tmp_path):
+async def test_ready_reports_nothing_when_the_white_cell_resolves(tmp_path):
     errors = []
     bot = RangeControlBot(
         config_for(tmp_path), advisor=object(), audit=AuditLog(tmp_path),
         on_error=errors.append,
     )
-    bot.tree.sync = AsyncMock()
-    bot.get_channel = lambda channel_id: object()
+    bot.get_channel = lambda channel_id: _text_channel()
     bot.fetch_channel = AsyncMock()
 
-    await bot.setup_hook()
+    await bot.on_ready()
 
     assert errors == []
+
+
+async def test_ready_reports_missing_posting_permissions(tmp_path):
+    """Seeing the channel is not enough: without Embed Links every ruling's
+    audit embed would fail, one logger.exception at a time."""
+    errors = []
+    bot = RangeControlBot(
+        config_for(tmp_path), advisor=object(), audit=AuditLog(tmp_path),
+        on_error=errors.append,
+    )
+    bot.get_channel = lambda channel_id: _text_channel(embed_links=False)
+
+    await bot.on_ready()
+
+    assert errors and "Embed Links" in errors[0]
+
+
+async def test_ready_warns_about_an_allowed_channel_the_bot_cannot_read(tmp_path):
+    errors = []
+    config = load_config(
+        {**BASE_ENV, "RANGE_DIR": str(tmp_path), "ALLOWED_CHANNEL_IDS": "777"}
+    )
+    bot = RangeControlBot(
+        config, advisor=object(), audit=AuditLog(tmp_path), on_error=errors.append,
+    )
+    channels = {12345: _text_channel(), 777: _text_channel("blue-1", view_channel=False)}
+    bot.get_channel = lambda channel_id: channels.get(channel_id)
+
+    await bot.on_ready()
+
+    assert errors
+    assert "777" in errors[0]
+    assert "ignored" in errors[0]
+
+
+async def test_ready_checks_channels_only_once_across_reconnects(tmp_path):
+    bot = RangeControlBot(config_for(tmp_path), advisor=object(), audit=AuditLog(tmp_path))
+    bot.get_channel = lambda channel_id: None
+    bot.fetch_channel = AsyncMock(return_value=_text_channel())
+
+    await bot.on_ready()
+    await bot.on_ready()
+
+    bot.fetch_channel.assert_awaited_once_with(12345)
 
 
 def real_bot(tmp_path):
@@ -315,39 +379,84 @@ def real_bot(tmp_path):
     return RangeControlBot(config_for(tmp_path), advisor, AuditLog(tmp_path))
 
 
-async def test_setup_hook_logs_a_banner_when_the_white_cell_is_unreachable(
-    tmp_path, caplog
-):
+async def test_ready_logs_a_banner_with_the_reason_when_unreachable(tmp_path, caplog):
     bot = real_bot(tmp_path)
-    bot.tree.sync = AsyncMock()
     bot.get_channel = lambda channel_id: None
-    bot.fetch_channel = AsyncMock(side_effect=RuntimeError("missing access"))
+    bot.fetch_channel = AsyncMock(side_effect=_forbidden())
 
     with caplog.at_level(logging.ERROR):
-        await bot.setup_hook()  # must not raise — startup proceeds regardless
+        await bot.on_ready()  # must not raise -- startup proceeds regardless
 
     bot.fetch_channel.assert_awaited_once_with(12345)
     assert "WHITE CELL" in caplog.text
     assert "12345" in caplog.text
+    assert "cannot see" in caplog.text
 
 
-async def test_setup_hook_is_quiet_when_the_white_cell_resolves(tmp_path, caplog):
+async def test_ready_confirms_the_white_cell_channel_when_it_works(tmp_path, caplog):
+    """Silence on success left operators unsure whether oversight was wired
+    up at all; a positive line names the channel that was verified."""
     bot = real_bot(tmp_path)
-    bot.tree.sync = AsyncMock()
-    bot.get_channel = lambda channel_id: object()
-    bot.fetch_channel = AsyncMock()
+    bot.get_channel = lambda channel_id: _text_channel()
 
-    with caplog.at_level(logging.ERROR):
-        await bot.setup_hook()
+    with caplog.at_level(logging.INFO):
+        await bot.on_ready()
 
-    bot.fetch_channel.assert_not_awaited()
     assert "WHITE CELL" not in caplog.text
+    assert "white-cell" in caplog.text
+    assert "verified" in caplog.text.lower()
 
 
 async def test_setup_hook_does_not_block_startup_on_sync_failure(tmp_path, caplog):
     bot = real_bot(tmp_path)
     bot.tree.sync = AsyncMock(side_effect=RuntimeError("discord unreachable"))
-    bot.get_channel = lambda channel_id: object()
-    bot.fetch_channel = AsyncMock()
 
     await bot.setup_hook()  # must not raise
+
+
+class ThreadRecordingAdvisor:
+    """Records which thread advise() ran on."""
+
+    def __init__(self):
+        self.thread_ids = []
+
+    def advise(self, question):
+        from rangecontrol.advisor.models import Advice
+
+        self.thread_ids.append(threading.get_ident())
+        return Advice(kind="deflection", public_text="nope")
+
+
+async def test_advise_runs_off_the_event_loop_thread(tmp_path):
+    """The provider SDKs are synchronous. Running a 30-second ruling on the
+    event loop thread stalls Discord's heartbeat and every other question
+    and reaction until it returns."""
+    advisor = ThreadRecordingAdvisor()
+    bot = FakeBot(advisor, AuditLog(tmp_path), RateLimiter(100, 60))
+
+    assert await ask(bot) == "nope"
+
+    assert advisor.thread_ids == [advisor.thread_ids[0]]
+    assert advisor.thread_ids[0] != threading.get_ident()
+
+
+async def test_slash_command_in_a_disallowed_channel_gets_an_ephemeral_refusal(tmp_path):
+    """Silently ignoring the interaction makes Discord show 'The application
+    did not respond', which reads as a crash rather than a scope decision."""
+    config = load_config(
+        {**BASE_ENV, "RANGE_DIR": str(tmp_path), "ALLOWED_CHANNEL_IDS": "777"}
+    )
+    bot = RangeControlBot(config, advisor=object(), audit=AuditLog(tmp_path))
+    interaction = SimpleNamespace(
+        channel_id=999,
+        channel=SimpleNamespace(name="elsewhere"),
+        user=SimpleNamespace(id=1),
+        response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+        followup=SimpleNamespace(send=AsyncMock()),
+    )
+
+    await bot.handle_slash(interaction, "can we block 203.0.113.10")
+
+    interaction.response.send_message.assert_awaited_once()
+    assert interaction.response.send_message.await_args.kwargs.get("ephemeral") is True
+    interaction.followup.send.assert_not_awaited()

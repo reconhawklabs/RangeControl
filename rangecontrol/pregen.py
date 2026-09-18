@@ -12,12 +12,12 @@ from pathlib import Path
 
 from rangecontrol.ingest.cache import ExtractionCache
 from rangecontrol.ingest.discovery import discover
-from rangecontrol.ingest.extractors.registry import EXTRACTOR_VERSION, extractor_for
+from rangecontrol.ingest.extractors.registry import cache_version, extractor_for
 
 
 def _version_for(path: Path) -> tuple[str, str]:
     kind, _ = extractor_for(path)
-    return kind, f"{EXTRACTOR_VERSION}-{kind}"
+    return kind, cache_version(kind)
 
 
 def _relative(resources_dir: Path, resource: Path) -> str:

@@ -161,6 +161,167 @@ def test_streaming_path_still_wraps_sdk_failures():
 def test_describe_image_sends_base64_image_block():
     provider, messages = build(Response([Block("text", "a diagram")]))
     assert provider.describe_image(data=b"bytes", mime_type="image/png", prompt="p") == "a diagram"
-    content = messages.kwargs["messages"][0]["content"]
+    # Image budgets sit above STREAM_THRESHOLD, so the request streams.
+    content = messages.stream_kwargs["messages"][0]["content"]
     assert content[0]["type"] == "image"
     assert content[0]["source"]["media_type"] == "image/png"
+
+
+def test_request_failures_carry_the_sdk_message():
+    """'BadRequestError' alone tells an operator nothing; the SDK's message
+    ('prompt is too long: ...') is what they need to act on."""
+    class TooLong(Exception):
+        message = "prompt is too long: 250000 tokens > 200000 maximum"
+
+    class Messages:
+        def create(self, **kwargs):
+            raise TooLong("prompt is too long: 250000 tokens > 200000 maximum")
+
+        def stream(self, **kwargs):
+            raise TooLong("prompt is too long")
+
+    class Client:
+        messages = Messages()
+
+    provider = AnthropicProvider(api_key="k", model="m", client=Client())
+    with pytest.raises(LLMError, match="prompt is too long"):
+        provider.complete(system="s", user="u")
+
+
+def test_effort_is_sent_inside_output_config():
+    provider, messages = build(Response([Block("text", "{}")]))
+    provider.complete(system="s", user="u", effort="medium")
+    assert messages.kwargs["output_config"]["effort"] == "medium"
+
+
+def test_effort_and_schema_share_output_config():
+    schema = {"type": "object", "properties": {}, "required": [], "additionalProperties": False}
+    provider, messages = build(Response([Block("text", "{}")]))
+    provider.complete(system="s", user="u", schema=schema, effort="high")
+    config = messages.kwargs["output_config"]
+    assert config["effort"] == "high"
+    assert config["format"]["schema"] == schema
+
+
+def test_a_model_that_rejects_effort_is_retried_without_it_once():
+    """Haiku 4.5 returns a 400 for output_config.effort. That must cost one
+    retry on the first call, not a refusal on every question."""
+    class Rejects(Exception):
+        status_code = 400
+        message = "output_config.effort: Extra inputs are not permitted"
+
+    class Messages:
+        def __init__(self):
+            self.calls = []
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            if "effort" in kwargs.get("output_config", {}):
+                raise Rejects(self.message)
+            return Response([Block("text", "ok")])
+
+        def stream(self, **kwargs):
+            raise AssertionError("not used at this max_tokens")
+
+    Messages.message = Rejects.message
+    messages = Messages()
+
+    class Client:
+        pass
+
+    client = Client()
+    client.messages = messages
+    provider = AnthropicProvider(api_key="k", model="claude-haiku-4-5", client=client)
+
+    assert provider.complete(system="s", user="u", effort="medium") == "ok"
+    assert len(messages.calls) == 2
+    assert "output_config" not in messages.calls[1]
+
+    provider.complete(system="s", user="u", effort="medium")
+    assert len(messages.calls) == 3  # learned: no effort, no retry
+
+
+def test_describe_image_gets_a_budget_that_survives_thinking():
+    """Observed on a real range PDF: a 4000 cap was consumed by reasoning
+    before a single word of the description came back."""
+    provider, messages = build(Response([Block("text", "a diagram")]))
+    provider.describe_image(data=b"x", mime_type="image/png", prompt="p", effort="medium")
+    assert messages.stream_kwargs is not None  # large budgets go through streaming
+    assert messages.stream_kwargs["max_tokens"] >= 16000
+    assert messages.stream_kwargs["output_config"]["effort"] == "medium"
+
+
+class _BetaMessages:
+    def __init__(self, response):
+        self.response = response
+        self.kwargs = None
+        self.stream_kwargs = None
+
+    def create(self, **kwargs):
+        self.kwargs = kwargs
+        return self.response
+
+    def stream(self, **kwargs):
+        self.stream_kwargs = kwargs
+        return _StreamContext(self.response)
+
+
+class _StreamContext:
+    def __init__(self, response):
+        self._response = response
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def get_final_message(self):
+        return self._response
+
+
+def _beta_client(response):
+    client = type("Client", (), {})()
+    client.messages = _BetaMessages(response)
+    client.beta = type("Beta", (), {})()
+    client.beta.messages = _BetaMessages(response)
+    return client
+
+
+def test_refusal_fallbacks_are_requested_on_the_beta_surface():
+    """A classifier false positive on range material must be re-run on
+    Anthropic's recommended fallback model server-side, not handed to the
+    blue team as an outage."""
+    client = _beta_client(Response([Block("text", "ok")]))
+    provider = AnthropicProvider(api_key="k", model="claude-opus-5", client=client)
+    assert provider.complete(system="s", user="u") == "ok"
+    sent = client.beta.messages.kwargs
+    assert sent["fallbacks"] == "default"
+    assert "server-side-fallback-2026-07-01" in sent["betas"]
+    assert client.messages.kwargs is None
+
+
+def test_a_platform_that_rejects_fallbacks_is_retried_without_them_once():
+    class Rejects(Exception):
+        status_code = 400
+        message = "fallbacks: Extra inputs are not permitted"
+
+    client = _beta_client(Response([Block("text", "ok")]))
+
+    def refuse(**kwargs):
+        raise Rejects(Rejects.message)
+
+    client.beta.messages.create = refuse
+    provider = AnthropicProvider(api_key="k", model="claude-opus-5", client=client)
+    assert provider.complete(system="s", user="u") == "ok"
+    assert "fallbacks" not in client.messages.kwargs
+    provider.complete(system="s", user="u")  # no second attempt on the beta path
+
+
+def test_a_refusal_names_its_category_for_the_white_cell():
+    details = type("Details", (), {"category": "cyber", "explanation": "Declined."})()
+    response = Response([], stop_reason="refusal")
+    response.stop_details = details
+    provider, _ = build(response)
+    with pytest.raises(LLMError, match="category=cyber"):
+        provider.complete(system="s", user="u")

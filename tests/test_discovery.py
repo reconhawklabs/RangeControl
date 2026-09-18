@@ -4,6 +4,7 @@ from rangecontrol.ingest.cache import ExtractionCache
 from rangecontrol.ingest.discovery import build_corpus, discover
 from rangecontrol.ingest.extractors.registry import EXTRACTOR_VERSION, extractor_for
 from tests.support.stub_provider import StubProvider
+from tests.support.images import write_png
 
 
 @pytest.fixture()
@@ -90,7 +91,7 @@ def test_no_readable_doc_ever_has_blank_text(resources, tmp_path):
 
 
 def test_second_run_uses_cache_and_skips_the_provider(resources, tmp_path):
-    (resources / "diagram.png").write_bytes(b"\x89PNG" + b"\x00" * 32)
+    write_png((resources / "diagram.png"))
     cache = ExtractionCache(tmp_path / "c")
 
     first = StubProvider(image_text="a diagram")
@@ -101,3 +102,35 @@ def test_second_run_uses_cache_and_skips_the_provider(resources, tmp_path):
     corpus = build_corpus(resources, second, cache)
     assert second.image_calls == []
     assert any(d.text == "a diagram" for d in corpus.readable())
+
+
+def test_an_enormous_file_is_truncated_and_flagged(resources, tmp_path):
+    """A 300 MB packet log would otherwise go into every ruling's prompt and
+    fail the API call with an unhelpful 400. The head is kept, the cut is
+    marked in the text, and the report can name the file."""
+    from rangecontrol.ingest.discovery import MAX_DOC_CHARS
+
+    big = resources / "huge.log"
+    big.write_text("x" * (MAX_DOC_CHARS + 500), encoding="utf-8")
+    corpus = build_corpus(resources, StubProvider(), ExtractionCache(tmp_path / "c"))
+    doc = next(d for d in corpus.docs if d.path == "huge.log")
+    assert doc.error is None
+    assert doc.truncated
+    assert len(doc.text) < MAX_DOC_CHARS + 200
+    assert "truncated" in doc.text[-200:].lower()
+    assert corpus.truncated_docs() == (doc,)
+
+
+def test_truncation_keeps_the_embedded_image_descriptions(resources, tmp_path):
+    """The descriptions are paid for and, for a scanned brief, the only
+    part that matters; the cut lands in the text ahead of them."""
+    from rangecontrol.ingest.discovery import MAX_DOC_CHARS, _record
+    from rangecontrol.ingest.extractors.embedded import EMBEDDED_IMAGES_HEADER
+
+    body = "t" * (MAX_DOC_CHARS + 1000)
+    images = f"{EMBEDDED_IMAGES_HEADER}\n[page 1 image 1]\nFW-1 joins HQ-LAN to DMZ."
+    doc = _record("brief.pdf", "pdf", f"{body}\n\n{images}")
+    assert doc.truncated
+    assert doc.text.endswith("FW-1 joins HQ-LAN to DMZ.")
+    assert "TRUNCATED" in doc.text
+    assert len(doc.text) <= MAX_DOC_CHARS + 400

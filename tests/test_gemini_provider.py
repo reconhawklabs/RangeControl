@@ -362,3 +362,42 @@ def test_a_client_without_caches_support_still_works():
     provider, models = build("ok")
     assert provider.complete(system=BIG_SYSTEM, user="u") == "ok"
     assert models.kwargs["config"]["system_instruction"] == BIG_SYSTEM
+
+
+def test_concurrent_questions_create_the_standing_context_cache_once():
+    """Rulings now run on worker threads, so two questions can arrive at the
+    provider together. Racing them into two cache uploads of the same
+    context doubles the cost of the biggest request the bot ever makes."""
+    import threading
+    import time
+
+    class SlowCaches(FakeCaches):
+        def create(self, **kwargs):
+            time.sleep(0.05)
+            return super().create(**kwargs)
+
+    caches = SlowCaches()
+    provider = GeminiProvider(
+        api_key="k", model="gemini-2.5-pro",
+        client=CachingClient(FakeModels(text="ok"), caches),
+    )
+    barrier = threading.Barrier(4)
+
+    def ask():
+        barrier.wait()
+        provider.complete(system=BIG_SYSTEM, user="u")
+
+    threads = [threading.Thread(target=ask) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len(caches.calls) == 1
+
+
+def test_safety_thresholds_are_relaxed_for_range_material():
+    provider, models = build("ok")
+    provider.complete(system="s", user="u")
+    settings = models.kwargs["config"]["safety_settings"]
+    assert all(item["threshold"] == "BLOCK_ONLY_HIGH" for item in settings)
+    assert any(item["category"] == "HARM_CATEGORY_DANGEROUS_CONTENT" for item in settings)

@@ -83,3 +83,32 @@ def test_fallback_raises_on_content_with_no_readable_text(tmp_path):
     path.write_bytes(bytes(range(1, 20)))
     with pytest.raises(ValueError):
         extract_fallback(path, StubProvider())
+
+
+@pytest.mark.parametrize(
+    "name,expected_kind",
+    [
+        ("brief.pptx", "presentation"),
+        ("harden.ps1", "text"),
+        ("deploy.sh", "text"),
+        ("scorer.py", "text"),
+        ("portal.html", "text"),
+        ("config.toml", "text"),
+        ("scan.nmap", "text"),
+    ],
+)
+def test_scripts_and_slides_get_real_extractors(name, expected_kind):
+    """Scripts used to fall through to the printable-run scraper, which drops
+    every non-ASCII byte and all structure. They are text."""
+    kind, _ = extractor_for(Path(name))
+    assert kind == expected_kind
+
+
+def test_cache_version_is_per_kind():
+    """Bumping the PDF extractor must not throw away every paid-for image
+    description. Each kind carries its own version in the cache key."""
+    from rangecontrol.ingest.extractors.registry import cache_version
+
+    assert cache_version("text") == f"{EXTRACTOR_VERSION}-text"
+    assert cache_version("pdf").endswith("-pdf")
+    assert cache_version("pdf") != cache_version("text")

@@ -454,3 +454,21 @@ def test_set_human_in_the_loop_is_a_harmless_no_op_after_stop():
     assert wait_for(controller, RUNNING)
     controller.stop()
     controller.set_human_in_the_loop(True)  # must not raise: no bot to reach
+
+
+def test_set_denied_text_updates_the_live_bot():
+    events = queue.Queue()
+    bot = FakeBot()
+    controller = BotController(events, bot_factory=lambda **kwargs: bot)
+    controller.start(config=object(), advisor=object(), audit=object())
+    try:
+        wait_for(controller, RUNNING)
+        controller.set_denied_text("Nope.")
+        assert bot.denied_text == "Nope."
+    finally:
+        controller.stop()
+
+
+def test_set_denied_text_is_a_harmless_no_op_before_any_bot_exists():
+    controller = BotController(queue.Queue())
+    controller.set_denied_text("Nope.")  # must not raise

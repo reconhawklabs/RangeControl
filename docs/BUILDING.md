@@ -115,7 +115,8 @@ PyInstaller's static analysis actually finds everything it needs:
 
    ```python
    for package in ("anthropic", "google.genai", "discord", "pypdf",
-                   "openpyxl", "docx", "your_new_package"):
+                   "openpyxl", "docx", "pptx", "PIL", "certifi",
+                   "your_new_package"):
        pkg_datas, pkg_binaries, pkg_hidden = collect_all(package)
        datas += pkg_datas
        binaries += pkg_binaries

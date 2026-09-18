@@ -18,6 +18,10 @@ class ExtractedDoc:
     kind: str
     text: str
     error: str | None = None
+    # True when ``text`` is the head of a file too large to include whole.
+    # The cut is also marked inside ``text`` so the model knows it is
+    # reading a prefix, not the document.
+    truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -31,6 +35,9 @@ class Corpus:
 
     def unreadable(self) -> tuple[ExtractedDoc, ...]:
         return tuple(d for d in self.docs if d.error is not None)
+
+    def truncated_docs(self) -> tuple[ExtractedDoc, ...]:
+        return tuple(d for d in self.docs if d.error is None and d.truncated)
 
     def counts_by_kind(self) -> tuple[tuple[str, int], ...]:
         counts = Counter(d.kind for d in self.readable())

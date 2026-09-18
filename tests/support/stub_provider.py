@@ -25,18 +25,32 @@ class StubProvider:
         user: str,
         schema: dict | None = None,
         max_tokens: int = 2000,
+        effort: str | None = None,
     ) -> str:
         self.calls.append(
-            {"system": system, "user": user, "schema": schema, "max_tokens": max_tokens}
+            {
+                "system": system,
+                "user": user,
+                "schema": schema,
+                "max_tokens": max_tokens,
+                "effort": effort,
+            }
         )
         if self._error is not None:
             raise self._error
         assert self._completions, "StubProvider ran out of queued completions"
         return self._completions.pop(0)
 
-    def describe_image(self, *, data: bytes, mime_type: str, prompt: str) -> str:
+    def describe_image(
+        self,
+        *,
+        data: bytes,
+        mime_type: str,
+        prompt: str,
+        effort: str | None = None,
+    ) -> str:
         self.image_calls.append(
-            {"size": len(data), "mime_type": mime_type, "prompt": prompt}
+            {"size": len(data), "mime_type": mime_type, "prompt": prompt, "effort": effort}
         )
         if self._error is not None:
             raise self._error

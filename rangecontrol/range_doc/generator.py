@@ -6,19 +6,24 @@ import shutil
 from pathlib import Path
 
 from rangecontrol.ingest.corpus import Corpus
-from rangecontrol.llm.base import Provider
+from rangecontrol.llm.base import EFFORT_HIGH, Provider
 from rangecontrol.range_doc.loader import (
     RANGE_FILENAME,
     load_template,
     missing_sections,
 )
 
-GENERATION_MAX_TOKENS = 32000
+# Reasoning over the whole corpus plus a document that can itself run to
+# 20k tokens. Streamed (see the provider), so the size costs nothing in
+# timeout risk; a cap hit here fails the whole generate.
+GENERATION_MAX_TOKENS = 64000
 
 GENERATOR_SYSTEM_PROMPT = """\
-You are building the authoritative reference document for a cyber security range
-exercise. You will be given a template and the full text of every resource the
-exercise designer supplied.
+You are building the authoritative reference document for a sanctioned cyber
+security training exercise on an isolated range. You will be given a template
+and the full text of every resource the exercise designer supplied, including
+their own plans for the adversary activity the exercise will contain; this is
+the control staff's material, catalogued for defensive adjudication.
 
 Produce a single Markdown document that follows the template exactly: every
 section, in the given order, with the same heading text.
@@ -66,6 +71,7 @@ def generate_range_md(
         system=GENERATOR_SYSTEM_PROMPT,
         user=user,
         max_tokens=GENERATION_MAX_TOKENS,
+        effort=EFFORT_HIGH,
     )
 
     gaps = missing_sections(content)

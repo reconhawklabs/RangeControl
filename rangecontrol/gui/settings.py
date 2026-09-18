@@ -21,6 +21,13 @@ class Field:
     secret: bool = False
     required: bool = False
     hint: str = ""
+    # Which of the two form columns holds the field. None on every field
+    # means "split the list evenly"; the real form places them explicitly
+    # so the credentials sit together on the left and the Discord and
+    # ruling settings on the right.
+    column: int | None = None
+    # Visible rows for a multiline field.
+    lines: int = 4
 
 
 FIELDS: tuple[Field, ...] = (
@@ -31,15 +38,21 @@ FIELDS: tuple[Field, ...] = (
     Field("DISCORD_BOT_TOKEN", "Discord bot token", secret=True, required=True,
           hint="Developer Portal -> your app -> Bot -> Reset Token"),
     Field("WHITE_CELL_CHANNEL_ID", "White cell channel ID", required=True,
-          hint="right-click the channel -> Copy Channel ID"),
+          hint="right-click the channel -> Copy Channel ID", column=1),
     Field("ALLOWED_CHANNEL_IDS", "Allowed channels",
-          hint="comma-separated channel IDs, not names; blank means every channel"),
+          hint="comma-separated channel IDs, not names; blank means every channel",
+          column=1),
     Field("EXTRA_INSTRUCTIONS", "Extra instructions to the AI", multiline=True,
           hint="optional; exercise-specific guidance for rulings, e.g. windows, "
                "scope, or standing decisions. It cannot relax the "
-               "non-disclosure rules."),
+               "non-disclosure rules.", column=1),
     Field("HUMAN_IN_THE_LOOP", "Human in the loop",
-          hint="hold every ruling for white cell approval before the blue team sees it"),
+          hint="hold every ruling for white cell approval before the blue team sees it",
+          column=1),
+    # No hint by request: the label says what it is, and the box is only
+    # editable while human in the loop is ticked, which says when it applies.
+    Field("HITL_DENIED_TEXT", "Reply when the white cell denies", multiline=True,
+          column=1, lines=3),
 )
 
 # Suggestions only. The combobox accepts any string: new models ship faster

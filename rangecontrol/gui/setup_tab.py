@@ -11,6 +11,7 @@ import math
 import tkinter as tk
 from tkinter import ttk
 
+from rangecontrol.config import DEFAULT_HITL_DENIED_TEXT
 from rangecontrol.gui.settings import FIELDS, VALID_PROVIDERS, is_configured, models_for
 from rangecontrol.range_doc.report import LARGE_CONTEXT_CHARS, IngestReport
 
@@ -65,6 +66,23 @@ class SetupTab(ttk.Frame):
                             on_refresh)
         self._sync_model_choices()
         self._refresh_buttons()
+        self._sync_denied_editable()
+
+    def _sync_denied_editable(self) -> None:
+        """The denial reply only matters with human in the loop on.
+
+        Disabled otherwise, so nobody spends time wording a message that is
+        never sent. The text stays visible and is still saved and loaded;
+        only typing is blocked.
+        """
+        widget = self._entries.get("HITL_DENIED_TEXT")
+        if widget is None:
+            return
+        enabled = self._vars["HUMAN_IN_THE_LOOP"].get() == "true"
+        widget.configure(
+            state="normal" if enabled else "disabled",
+            foreground="black" if enabled else "#888",
+        )
 
     def _build_fields(self) -> None:
         grid = ttk.Frame(self)
@@ -74,15 +92,31 @@ class SetupTab(ttk.Frame):
         grid.columnconfigure(0, weight=1, uniform="fields")
         grid.columnconfigure(1, weight=1, uniform="fields")
 
-        # Two columns, filled top-to-bottom then left-to-right. The row
-        # count per column is derived from how many fields exist rather than
-        # hardcoded, so the layout keeps working as FIELDS grows.
+        # Each column is its own grid. With both columns in one grid every
+        # row is as tall as its tallest cell, so a four-line text box on the
+        # right opened a matching hole under a one-line entry on the left.
+        columns = []
+        for index in range(2):
+            frame = ttk.Frame(grid)
+            frame.grid(row=0, column=index, sticky="new")
+            frame.columnconfigure(0, weight=1)
+            columns.append(frame)
+        next_row = [0, 0]
+
+        # Explicit placement when any field declares a column; otherwise
+        # split evenly, top-to-bottom then left-to-right.
+        explicit = any(field.column is not None for field in FIELDS)
         rows_per_column = math.ceil(len(FIELDS) / 2)
 
         for index, field in enumerate(FIELDS):
-            column, row = divmod(index, rows_per_column)
-            cell = ttk.Frame(grid, padding=(0, 4, 14, 4))
-            cell.grid(row=row, column=column, sticky="ew")
+            if explicit:
+                column = 1 if field.column == 1 else 0
+            else:
+                column = index // rows_per_column
+            row = next_row[column]
+            next_row[column] += 1
+            cell = ttk.Frame(columns[column], padding=(0, 4, 14, 4))
+            cell.grid(row=row, column=0, sticky="ew")
             cell.columnconfigure(0, weight=1)
 
             label = field.label + ("  (required)" if field.required else "")
@@ -107,8 +141,11 @@ class SetupTab(ttk.Frame):
                 # A Text, not an Entry: guidance is a paragraph. Text carries
                 # no control variable, so this field's StringVar goes unused
                 # and values()/set_values() read the widget itself.
-                widget = tk.Text(cell, height=4, wrap="word", undo=True,
-                                 relief="solid", borderwidth=1)
+                # width in characters is a starting request only (the cell
+                # stretches it); Text's default of 80 asked for a window
+                # wider than a laptop screen.
+                widget = tk.Text(cell, height=field.lines, width=40, wrap="word",
+                                 undo=True, relief="solid", borderwidth=1)
 
                 # <<Modified>> is the one event a Text fires for typed and
                 # programmatic edits alike, and it latches - the flag has to be
@@ -235,6 +272,7 @@ class SetupTab(ttk.Frame):
     def _changed(self) -> None:
         self._sync_model_choices()
         self._refresh_buttons()
+        self._sync_denied_editable()
         self._on_change()
 
     def _refresh_buttons(self) -> None:
@@ -281,18 +319,27 @@ class SetupTab(ttk.Frame):
         widget = self._entries.get(key)
         if widget is None:
             return
+        # A disabled Text refuses programmatic edits too, so lift the state
+        # for the load and put it back.
+        previous_state = str(widget.cget("state"))
         self._suspend_multiline = True
         try:
+            widget.configure(state="normal")
             widget.delete("1.0", "end")
             if text:
                 widget.insert("1.0", text)
             widget.edit_modified(False)
         finally:
+            widget.configure(state=previous_state)
             self._suspend_multiline = False
 
     def set_values(self, values: dict[str, str]) -> None:
         for key, var in self._vars.items():
             value = values.get(key, "")
+            if key == "HITL_DENIED_TEXT" and not value.strip():
+                # Show the wording that will actually be sent, so the
+                # operator edits from it rather than from a blank box.
+                value = DEFAULT_HITL_DENIED_TEXT
             if key in self._multiline_keys:
                 self._set_multiline(key, value)
                 continue

@@ -105,3 +105,16 @@ def test_an_unparseable_human_in_the_loop_value_is_rejected():
     """Silently reading "maybe" as off would leave rulings unreviewed."""
     with pytest.raises(ConfigError, match="HUMAN_IN_THE_LOOP"):
         load_config({**BASE_ENV, "HUMAN_IN_THE_LOOP": "maybe"})
+
+
+def test_denied_reply_defaults_to_the_built_in_text():
+    from rangecontrol.config import DEFAULT_HITL_DENIED_TEXT
+
+    assert load_config(BASE_ENV).hitl_denied_text == DEFAULT_HITL_DENIED_TEXT
+    blank = {**BASE_ENV, "HITL_DENIED_TEXT": "   "}
+    assert load_config(blank).hitl_denied_text == DEFAULT_HITL_DENIED_TEXT
+
+
+def test_denied_reply_can_be_customised():
+    env = {**BASE_ENV, "HITL_DENIED_TEXT": "  Not at this time.  "}
+    assert load_config(env).hitl_denied_text == "Not at this time."

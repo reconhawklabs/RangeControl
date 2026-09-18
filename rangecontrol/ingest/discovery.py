@@ -10,7 +10,8 @@ from pathlib import Path
 
 from rangecontrol.ingest.cache import ExtractionCache
 from rangecontrol.ingest.corpus import Corpus, ExtractedDoc
-from rangecontrol.ingest.extractors.registry import EXTRACTOR_VERSION, extractor_for
+from rangecontrol.ingest.extractors.embedded import EMBEDDED_IMAGES_HEADER
+from rangecontrol.ingest.extractors.registry import cache_version, extractor_for
 from rangecontrol.llm.base import Provider
 
 
@@ -32,6 +33,21 @@ def discover(resources_dir: Path) -> tuple[Path, ...]:
     return tuple(sorted(found, key=lambda p: p.relative_to(root).as_posix()))
 
 
+# Per-file ceiling on what reaches the model context. Range.md plus the whole
+# corpus goes into every ruling, and one packet log or SIEM export can be
+# larger than any model's window on its own; the API then fails the call
+# with a 400 nobody can act on. The head is kept, the cut is marked, and the
+# ingest report names the file. The cache keeps the full text, so raising
+# this later costs no re-extraction.
+MAX_DOC_CHARS = 300_000
+
+_TRUNCATION_NOTE = (
+    "\n\n[TRUNCATED: {omitted:,} more characters of this file were not "
+    "included. Only the beginning is above. If the rest matters, split the "
+    "file or trim it to the relevant part.]"
+)
+
+
 def _record(relative: str, kind: str, text: str) -> ExtractedDoc:
     """Build a doc, enforcing the invariant that empty text always means error.
 
@@ -49,7 +65,28 @@ def _record(relative: str, kind: str, text: str) -> ExtractedDoc:
             text="",
             error="extractor returned no usable text",
         )
+    if len(text) > MAX_DOC_CHARS:
+        return ExtractedDoc(
+            path=relative, kind=kind, text=_truncate(text), truncated=True
+        )
     return ExtractedDoc(path=relative, kind=kind, text=text)
+
+
+def _truncate(text: str) -> str:
+    """Cut ``text`` to the ceiling, keeping any trailing image descriptions.
+
+    Vision descriptions are the most expensive part of an extraction and,
+    for a scanned brief, the only part that matters. They sit after the
+    header in PDF and DOCX output, so the cut lands in the plain text ahead
+    of them rather than on them.
+    """
+    head, header, tail = text.partition(EMBEDDED_IMAGES_HEADER)
+    budget = max(MAX_DOC_CHARS - len(header) - len(tail), MAX_DOC_CHARS // 2)
+    omitted = len(head) - budget
+    if omitted <= 0:
+        return text
+    cut = head[:budget] + _TRUNCATION_NOTE.format(omitted=omitted)
+    return cut if not header else f"{cut}\n\n{header}{tail}"
 
 
 def build_corpus(
@@ -62,7 +99,7 @@ def build_corpus(
     for path in discover(root):
         relative = path.relative_to(root).as_posix()
         kind, extract = extractor_for(path)
-        version = f"{EXTRACTOR_VERSION}-{kind}"
+        version = cache_version(kind)
 
         cached = cache.get(path, version)
         if cached is not None:

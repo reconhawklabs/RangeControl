@@ -102,3 +102,26 @@ def test_advice_defaults():
 
 def test_gate_result_defaults():
     assert GateResult(verdict=GateVerdict.AMBIGUOUS).reason == ""
+
+
+def test_each_stage_declares_its_effort():
+    """The gate is a classification; the ruling is the decision that can
+    break an exercise. Their reasoning budgets must not be left to whatever
+    the vendor defaults to that month."""
+    import json
+
+    from rangecontrol.advisor.gate import classify
+    from rangecontrol.advisor.ruling import adjudicate
+    from rangecontrol.llm.base import EFFORT_HIGH, EFFORT_MEDIUM
+    from tests.support.stub_provider import StubProvider
+
+    gate = StubProvider([json.dumps({"verdict": "CHANGE_REQUEST", "reason": "r"})])
+    classify("block 203.0.113.10 at the edge", gate)
+    assert gate.calls[0]["effort"] == EFFORT_MEDIUM
+
+    ruler = StubProvider([json.dumps({
+        "verdict": "APPROVED", "public_response": "ok", "internal_reason": "fine",
+        "impacted": [], "confidence": "high",
+    })])
+    adjudicate("block 203.0.113.10", "context", ruler)
+    assert ruler.calls[0]["effort"] == EFFORT_HIGH
