@@ -67,7 +67,9 @@ so this step is the main reason to pre-generate:
   and arrow directions, and transcribe every visible label, hostname, address,
   and port **verbatim**. Do not summarise.
 - **Spreadsheets**: one line per row, sheet names preserved.
-- **Documents**: full text including tables.
+- **Documents and slide decks**: full text including tables, speaker notes,
+  and a description of every embedded diagram or screenshot.
+- **Scripts and configs**: verbatim.
 
 Then record it:
 

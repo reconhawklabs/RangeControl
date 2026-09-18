@@ -114,10 +114,18 @@ def test_dotenv_is_loaded_without_overriding_the_real_environment(tmp_path, monk
     import rangecontrol.main as main_module
 
     calls = []
-    monkeypatch.setattr(main_module, "load_dotenv", lambda **kw: calls.append(kw))
+    monkeypatch.setattr(
+        main_module, "load_dotenv", lambda path, **kw: calls.append((path, kw))
+    )
     monkeypatch.setattr(main_module, "load_config", _raise_config_error)
     main(["--dry-run"])
-    assert calls == [{"override": False}]
+    assert len(calls) == 1
+    path, kwargs = calls[0]
+    # The app home's .env, so the CLI and the window read the same file;
+    # interpolate=False so "${...}" in EXTRA_INSTRUCTIONS stays literal, as
+    # the GUI's own parser already treats it.
+    assert path.name == ".env"
+    assert kwargs == {"override": False, "interpolate": False}
 
 
 def test_provider_failure_during_startup_prints_cleanly(tmp_path, monkeypatch, capsys):

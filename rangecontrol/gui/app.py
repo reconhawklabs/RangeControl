@@ -74,6 +74,18 @@ logger = logging.getLogger(__name__)
 PUMP_INTERVAL_MS = 100
 SAVE_DEBOUNCE_MS = 1000
 
+# Floor for the opening window size; the real size is measured from the
+# content in App._fit_to_content. The margin leaves room for a taskbar.
+_MIN_WIDTH = 980
+_MIN_HEIGHT = 700
+_SCREEN_MARGIN = 80
+# Added to the measured height: the status bar grows a second line for
+# warnings, and fonts differ across platforms and DPI settings.
+_HEIGHT_SLACK = 48
+# Hint labels re-wrap to their real column width only after the window is
+# mapped, so the content is measured again once that has happened.
+_REFIT_DELAY_MS = 150
+
 # BotState values for which the setup tab must present the bot as "running"
 # for gating purposes (Generate disabled, Start Bot relabelled Stop Bot).
 # Translated here, not inside SetupTab.set_bot_running: that widget takes a
@@ -87,6 +99,15 @@ _ACTIVE_BOT_STATES = (STARTING, RUNNING, STOPPING)
 # pass for an ingest-only Config without pretending the user filled them in.
 _INGEST_PLACEHOLDER_TOKEN = "unset"
 _INGEST_PLACEHOLDER_CHANNEL_ID = "0"
+
+# Fields a running bot picks up immediately; everything else is captured
+# once at Start Bot.
+_LIVE_FIELDS = frozenset({"HUMAN_IN_THE_LOOP", "HITL_DENIED_TEXT"})
+
+RESTART_HINT = (
+    "Settings changed. They are saved, but the running bot keeps its old "
+    "settings until you restart it (Stop Bot, then Start Bot)."
+)
 
 _STARTER_ENV = """\
 # RangeControl configuration.
@@ -127,7 +148,7 @@ class _RefusingProvider:
 
     def complete(
         self, *, system: str, user: str, schema: dict | None = None,
-        max_tokens: int = 2000,
+        max_tokens: int = 2000, effort: str | None = None,
     ) -> str:
         # Defensive, not load-bearing: prepare() only calls Provider.complete
         # to generate a fresh Range.md, and _load_existing_range only ever
@@ -137,7 +158,10 @@ class _RefusingProvider:
         # the one method this path happens to hit.
         raise LLMError(_STARTUP_REFUSAL_MESSAGE)
 
-    def describe_image(self, *, data: bytes, mime_type: str, prompt: str) -> str:
+    def describe_image(
+        self, *, data: bytes, mime_type: str, prompt: str,
+        effort: str | None = None,
+    ) -> str:
         raise LLMError(_STARTUP_REFUSAL_MESSAGE)
 
 
@@ -212,16 +236,20 @@ class App(tk.Tk):
         # an operator who never touched Generate must never be told
         # "Generate failed".
         self._ingest_is_startup_load = False
-        # Set once, at most, during _load_initial_state: an unreadable .env
-        # or resources/ is a standing fact about this whole window session
-        # (nothing re-reads .env until the operator edits and saves a field,
-        # and a locked resources/ does not fix itself), not something a
-        # later successful ingest of a cached Range.md resolves. Without
+        # Recorded during _load_initial_state: an unreadable .env or
+        # resources/ is a standing fact until proven otherwise, not something
+        # a later successful ingest of a cached Range.md resolves. Without
         # this, _handle_ingest's own success branch -- which must still
         # clear an unrelated Generate-failed warning -- would also wipe
-        # this one back to blank the moment the startup Range.md load
-        # (a separate, independent IngestJob) happens to finish.
-        self._startup_config_warning = ""
+        # these back to blank the moment the startup Range.md load (a
+        # separate, independent IngestJob) happens to finish. Keyed by
+        # source so each clears on its own evidence: a successful .env
+        # write clears the .env entry, a readable resources/ clears that one.
+        self._startup_config_warnings: dict[str, str] = {}
+        # Mirrors the last STATUS event, which is what every widget shows;
+        # the controller's own state can already have moved on by the time
+        # the event is pumped, and the hint must agree with the status bar.
+        self._bot_active = False
         self._save_after_id: str | None = None
         self._pump_after_id: str | None = None
         # True only for the duration of set_values() at load time: SetupTab
@@ -232,8 +260,6 @@ class App(tk.Tk):
         self._last_saved: dict[str, str] = {}
 
         self.title("RangeControl")
-        self.geometry("980x700")
-        self.minsize(840, 560)
 
         self._log_handler = QueueLogHandler(self._events)
         self._log_handler.setLevel(logging.WARNING)
@@ -258,9 +284,58 @@ class App(tk.Tk):
         self._status_bar.pack(fill="x", side="bottom")
 
         self._load_initial_state()
+        self._fit_to_content()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._pump_after_id = self.after(PUMP_INTERVAL_MS, self.pump)
+
+    def _fit_to_content(self) -> None:
+        """Open at whatever size shows every field and button.
+
+        A fixed geometry went stale the moment the form gained a field: the
+        buttons at the bottom sat below the window edge until the operator
+        dragged it taller. Measure the laid-out widgets instead, keep a
+        comfortable floor, and never exceed the screen.
+        """
+        self._apply_fit()
+        # Measure again after the first layout pass: wrapped hints and the
+        # status bar settle only once the window has its real width.
+        self.after(_REFIT_DELAY_MS, self._apply_fit)
+
+    def _apply_fit(self) -> None:
+        self.update_idletasks()
+        width = min(max(_MIN_WIDTH, self.winfo_reqwidth()), self.winfo_screenwidth())
+        height = min(
+            max(_MIN_HEIGHT, self.winfo_reqheight() + _HEIGHT_SLACK),
+            self.winfo_screenheight() - _SCREEN_MARGIN,
+        )
+        current = self.geometry().split("+")[0]
+        try:
+            current_width, current_height = (int(v) for v in current.split("x"))
+        except ValueError:
+            current_width = current_height = 0
+        # Only ever grow: shrinking under an operator who dragged the window
+        # larger would be worse than a little spare room.
+        width = max(width, current_width)
+        height = max(height, current_height)
+        self.geometry(f"{width}x{height}")
+        self.minsize(width, height)
+
+    def report_callback_exception(self, exc_type, exc, tb) -> None:
+        """Route an exception escaping a Tk callback to the operator.
+
+        Tk's default prints to stderr. The Windows binary is built with no
+        console, where stderr is None and the report goes nowhere: a button
+        that raised simply does nothing, with no trace anywhere. Log it (the
+        Console tab shows warnings and above) and pin it to the status bar.
+        """
+        logger.error(
+            "unhandled error in a GUI callback", exc_info=(exc_type, exc, tb)
+        )
+        with contextlib.suppress(Exception):
+            self._status_bar.set_warning(
+                f"Unexpected error: {exc_type.__name__}: {exc}"
+            )
 
     # -- startup ------------------------------------------------------
 
@@ -275,7 +350,7 @@ class App(tk.Tk):
         # silently never opens. Falling back to empty settings is honest: the
         # operator did not lose their configuration, it just could not be
         # read this time, and every field is still editable and re-savable.
-        startup_errors: list[str] = []
+        startup_errors: dict[str, str] = {}
         try:
             values = read_env(self._home / ENV_FILENAME)
         except OSError as exc:
@@ -283,7 +358,7 @@ class App(tk.Tk):
                 "could not read %s in %s: %s", ENV_FILENAME, self._home, exc
             )
             values = {}
-            startup_errors.append(f"Could not read {ENV_FILENAME}: {exc}")
+            startup_errors["env"] = f"Could not read {ENV_FILENAME}: {exc}"
 
         self._loading = True
         try:
@@ -294,7 +369,7 @@ class App(tk.Tk):
 
         resources_error = self._refresh_resources_present()
         if resources_error:
-            startup_errors.append(resources_error)
+            startup_errors["resources"] = resources_error
 
         self._status_bar.set_bot_state(self._controller.state)
 
@@ -304,7 +379,7 @@ class App(tk.Tk):
             # instead of clearing it -- a later, independent startup ingest
             # of Range.md succeeding says nothing about whether this
             # unrelated read ever worked.
-            self._startup_config_warning = " ".join(startup_errors)
+            self._startup_config_warnings = dict(startup_errors)
             # Reported through the same panel/status-bar path as every other
             # startup failure below (see _handle_ingest) -- generation 0
             # matches the counter's initial value, so this is never mistaken
@@ -313,7 +388,7 @@ class App(tk.Tk):
             self._handle_ingest(
                 IngestOutcome(
                     ok=False,
-                    error=" ".join(startup_errors),
+                    error=" ".join(startup_errors.values()),
                     generation=self._ingest_generation,
                 )
             )
@@ -424,7 +499,11 @@ class App(tk.Tk):
             self._setup_tab.set_resources_present(False)
             return f"Could not read resources/: {exc}"
         self._setup_tab.set_resources_present(present)
+        self._startup_config_warnings.pop("resources", None)
         return None
+
+    def _startup_config_warning(self) -> str:
+        return " ".join(self._startup_config_warnings.values())
 
     # -- autosave -------------------------------------------------------
 
@@ -437,9 +516,21 @@ class App(tk.Tk):
         # plain assignment). BotController.set_human_in_the_loop is a no-op
         # when no bot is running, so this is exactly as cheap as gating it
         # would be, without needing a second, field-specific callback.
+        values = self._setup_tab.values()
         self._controller.set_human_in_the_loop(
-            self._setup_tab.values().get("HUMAN_IN_THE_LOOP") == "true"
+            values.get("HUMAN_IN_THE_LOOP") == "true"
         )
+        self._controller.set_denied_text(values.get("HITL_DENIED_TEXT", ""))
+        # Everything except the checkbox is captured once at Start Bot. An
+        # edit made while the bot runs is saved, but silently has no effect
+        # until a restart -- say so, once, where the operator is looking.
+        if self._bot_active:
+            changed = {
+                key for key, value in values.items()
+                if value != self._last_saved.get(key, "")
+            }
+            if changed - _LIVE_FIELDS:
+                self._status_bar.set_warning(RESTART_HINT)
         if self._save_after_id is not None:
             self.after_cancel(self._save_after_id)
         self._save_after_id = self.after(SAVE_DEBOUNCE_MS, self._save_fields)
@@ -456,6 +547,12 @@ class App(tk.Tk):
             self._status_bar.set_warning(f"Could not save settings: {exc}")
             return
         self._last_saved = values
+        # A successful write is proof the file is usable again; the startup
+        # "could not read .env" warning would otherwise stand for the whole
+        # session, telling the operator their settings are broken when the
+        # very save that just happened shows they are not.
+        if self._startup_config_warnings.pop("env", None) is not None:
+            self._status_bar.set_warning(self._startup_config_warning())
 
     # -- queue pump -------------------------------------------------------
 
@@ -500,8 +597,9 @@ class App(tk.Tk):
             logger.warning("unrecognised GUI event kind: %r", event.kind)
 
     def _handle_status(self, state: BotState) -> None:
+        self._bot_active = state.state in _ACTIVE_BOT_STATES
         self._status_bar.set_bot_state(state)
-        self._setup_tab.set_bot_running(state.state in _ACTIVE_BOT_STATES)
+        self._setup_tab.set_bot_running(self._bot_active)
 
     def _handle_ingest(self, outcome: IngestOutcome) -> None:
         # The startup load and a user-initiated Generate can both be in
@@ -525,7 +623,7 @@ class App(tk.Tk):
             # succeeding after an unreadable .env, see _load_initial_state)
             # does not mean the operator's configuration became readable.
             # Blank when nothing is standing, which is every other case.
-            self._status_bar.set_warning(self._startup_config_warning)
+            self._status_bar.set_warning(self._startup_config_warning())
         else:
             # Keep whatever report a previous success produced: a failed
             # regenerate must not discard a still-valid Range.md/corpus.
@@ -553,17 +651,33 @@ class App(tk.Tk):
         window is open is honoured. Form values win over whatever is on
         disk for the keys the form does track.
         """
-        merged = {**read_env(self._home / ENV_FILENAME), **values}
+        try:
+            on_disk = read_env(self._home / ENV_FILENAME)
+        except OSError as exc:
+            # A transient lock (antivirus, another process) must not raise
+            # out of a button handler. The form still holds everything the
+            # operator typed, so proceed on that and say what was skipped.
+            logger.warning("could not re-read %s: %s", ENV_FILENAME, exc)
+            self._status_bar.set_warning(
+                f"Could not re-read {ENV_FILENAME} ({exc}); using the form's values."
+            )
+            on_disk = {}
+        merged = {**on_disk, **values}
         return to_config_mapping(merged, self._home)
 
+    @staticmethod
+    def _with_discord_placeholders(mapping: dict[str, str]) -> dict[str, str]:
+        """Fill the two Discord-only fields so load_config accepts a mapping
+        for work that never touches Discord: an ingest, or listing models."""
+        filled = dict(mapping)
+        if not filled.get("DISCORD_BOT_TOKEN", "").strip():
+            filled["DISCORD_BOT_TOKEN"] = _INGEST_PLACEHOLDER_TOKEN
+        if not filled.get("WHITE_CELL_CHANNEL_ID", "").strip():
+            filled["WHITE_CELL_CHANNEL_ID"] = _INGEST_PLACEHOLDER_CHANNEL_ID
+        return filled
+
     def _ingest_config(self, values: dict[str, str]) -> Config | None:
-        mapping = self._config_mapping(values)
-        if not mapping.get("DISCORD_BOT_TOKEN", "").strip():
-            mapping = {**mapping, "DISCORD_BOT_TOKEN": _INGEST_PLACEHOLDER_TOKEN}
-        if not mapping.get("WHITE_CELL_CHANNEL_ID", "").strip():
-            mapping = {
-                **mapping, "WHITE_CELL_CHANNEL_ID": _INGEST_PLACEHOLDER_CHANNEL_ID
-            }
+        mapping = self._with_discord_placeholders(self._config_mapping(values))
         try:
             return load_config(mapping)
         except ConfigError as exc:
@@ -676,8 +790,12 @@ class App(tk.Tk):
             )
             return
 
+        # Only the provider and its key matter here. The Discord token and
+        # channel IDs are validated at Start Bot, not before the operator has
+        # even picked a model.
+        mapping = self._with_discord_placeholders(self._config_mapping(values))
         try:
-            config = load_config(self._config_mapping(values))
+            config = load_config(mapping)
         except ConfigError as exc:
             self._setup_tab.set_report(
                 self._outcome.report if self._outcome else None,

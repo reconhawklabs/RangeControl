@@ -266,6 +266,19 @@ class BotController:
         if bot is not None:
             bot.mode.set(enabled)
 
+    def set_denied_text(self, text: str) -> None:
+        """Reword the live bot's denial reply without a restart.
+
+        Same shape as set_human_in_the_loop: read the handle under the lock,
+        act outside it, no-op when no bot exists. A restart mid-exercise
+        drops every pending approval, so anything the white cell can
+        reasonably change during play must apply live.
+        """
+        with self._lock:
+            bot = self._bot
+        if bot is not None:
+            bot.denied_text = text
+
     def _set_state(self, state: str, detail: str = "") -> None:
         new_state = BotState(state, detail)
         with self._lock:

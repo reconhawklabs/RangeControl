@@ -4,6 +4,7 @@ from rangecontrol.ingest.cache import ExtractionCache
 from rangecontrol.ingest.discovery import build_corpus
 from rangecontrol.pregen import cache_put, cache_status, format_status
 from tests.support.stub_provider import StubProvider
+from tests.support.images import write_png
 
 
 @pytest.fixture()
@@ -11,7 +12,7 @@ def resources(tmp_path):
     root = tmp_path / "resources"
     (root / "net").mkdir(parents=True)
     (root / "notes.txt").write_text("standing rules", encoding="utf-8")
-    (root / "net" / "diagram.png").write_bytes(b"\x89PNG" + b"\x00" * 32)
+    write_png((root / "net" / "diagram.png"))
     return root
 
 

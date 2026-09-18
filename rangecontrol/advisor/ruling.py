@@ -5,7 +5,7 @@ from __future__ import annotations
 from rangecontrol.advisor.gate import parse_json_object
 from rangecontrol.advisor.models import Ruling
 from rangecontrol.advisor.prompts import RULING_SCHEMA
-from rangecontrol.llm.base import LLMError, Provider
+from rangecontrol.llm.base import EFFORT_HIGH, LLMError, Provider
 
 # Same reasoning as GATE_MAX_TOKENS: on a thinking-by-default model, this
 # budget covers adaptive reasoning over the full range context as well as the
@@ -25,6 +25,8 @@ def adjudicate(question: str, context: str, provider: Provider) -> Ruling:
         user=f"Proposed change:\n{question.strip()}",
         schema=RULING_SCHEMA,
         max_tokens=RULING_MAX_TOKENS,
+        # The one call where a wrong answer breaks an exercise.
+        effort=EFFORT_HIGH,
     )
     payload = parse_json_object(raw)
 

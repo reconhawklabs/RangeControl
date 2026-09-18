@@ -14,6 +14,13 @@ DEFAULT_MODELS = {
     "gemini": "gemini-2.5-pro",
 }
 
+# Sent to the asker when the white cell denies a held ruling. Fixed text,
+# never derived from the ruling, so a denial can carry nothing about what
+# the change would have touched. The white cell may reword it in the GUI.
+DEFAULT_HITL_DENIED_TEXT = (
+    "That request has been denied to retain range integrity."
+)
+
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off", ""}
 
@@ -34,6 +41,7 @@ class Config:
     range_dir: Path
     human_in_the_loop: bool
     extra_instructions: str
+    hitl_denied_text: str = DEFAULT_HITL_DENIED_TEXT
 
 
 def _require(env: Mapping[str, str], name: str) -> str:
@@ -112,4 +120,8 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         # Free text from the white cell. Never stripped of content, only
         # of surrounding whitespace, so wording is theirs alone.
         extra_instructions=env.get("EXTRA_INSTRUCTIONS", "").strip(),
+        # Blank means "the built-in wording": an empty denial cannot be sent.
+        hitl_denied_text=(
+            env.get("HITL_DENIED_TEXT", "").strip() or DEFAULT_HITL_DENIED_TEXT
+        ),
     )

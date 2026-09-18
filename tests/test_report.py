@@ -137,3 +137,16 @@ def test_large_context_warns_and_counts_as_a_concern():
 
 def test_small_context_does_not_warn():
     assert "re-sent with every question" not in format_report(clean_report())
+
+
+def test_truncated_files_are_listed_and_count_as_a_concern():
+    from rangecontrol.ingest.corpus import Corpus, ExtractedDoc
+
+    docs = (
+        ExtractedDoc(path="ok.txt", kind="text", text="fine"),
+        ExtractedDoc(path="huge.log", kind="text", text="head…", truncated=True),
+    )
+    report = build_report(Corpus(docs=docs), RANGE_MD, generated=True)
+    assert report.truncated == ("huge.log",)
+    assert report.has_concerns() is True
+    assert "huge.log" in format_report(report)

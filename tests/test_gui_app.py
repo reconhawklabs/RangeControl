@@ -18,6 +18,7 @@ from rangecontrol.gui.runtime import (
     IngestOutcome,
 )
 from rangecontrol.range_doc.loader import REQUIRED_SECTIONS
+from tests.support.images import write_png
 
 
 def make_app(tmp_path):
@@ -139,7 +140,7 @@ def test_startup_load_never_calls_a_provider(tmp_path, monkeypatch):
 def test_an_uncached_image_does_not_spend_and_reports_clearly(tmp_path):
     """A cold cache must surface as a message, never as a silent API call."""
     write_complete_range(tmp_path)
-    (tmp_path / "resources" / "diagram.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    write_png((tmp_path / "resources" / "diagram.png"))
     app = make_app(tmp_path)
     try:
         pump_until(app, lambda: app._outcome is not None)
@@ -1428,5 +1429,160 @@ def test_a_failed_fetch_explains_itself_and_re_enables_the_button(tmp_path):
         app.update()
         assert "bad key" in app._setup_tab.status_text()
         assert str(app._setup_tab.fetch_models_button.cget("state")) != "disabled"
+    finally:
+        app.destroy()
+
+
+def test_fetch_needs_only_a_provider_and_an_api_key(tmp_path, monkeypatch):
+    """Listing models is a metadata call against the AI provider. Requiring
+    the Discord token and channel IDs first blocks the very first thing an
+    operator does on a fresh install: pick a model."""
+    app = make_app(tmp_path)
+    try:
+        started = []
+        monkeypatch.setattr(
+            "rangecontrol.gui.app.ModelsJob",
+            lambda config, events: started.append(config) or _NoopJob(),
+        )
+        app._setup_tab.set_values({
+            "LLM_PROVIDER": "anthropic", "LLM_API_KEY": "sk-test",
+            "DISCORD_BOT_TOKEN": "", "WHITE_CELL_CHANNEL_ID": "",
+        })
+        app._on_fetch_models()
+        assert len(started) == 1
+        assert started[0].llm_provider == "anthropic"
+        assert started[0].llm_api_key == "sk-test"
+    finally:
+        app.destroy()
+
+
+class _NoopJob:
+    def start(self):
+        return None
+
+
+def test_a_tk_callback_exception_reaches_the_operator(tmp_path):
+    """The Windows binary ships console=False, so Tk's default handler
+    (print to stderr) shows nothing at all."""
+    app = make_app(tmp_path)
+    try:
+        try:
+            raise RuntimeError("widget exploded")
+        except RuntimeError as exc:
+            app.report_callback_exception(type(exc), exc, exc.__traceback__)
+        assert "widget exploded" in app._status_bar.dump()
+    finally:
+        app.destroy()
+
+
+def test_an_unreadable_env_does_not_break_the_buttons(tmp_path, monkeypatch):
+    """Generate, Start, and Fetch all re-read .env; a transient lock there
+    must degrade to the form's values, not raise out of a button handler."""
+    app = make_app(tmp_path)
+    try:
+        def boom(path):
+            raise OSError("locked")
+        monkeypatch.setattr("rangecontrol.gui.app.read_env", boom)
+        app._setup_tab.set_values({"LLM_PROVIDER": "gemini", "LLM_API_KEY": "k"})
+        mapping = app._config_mapping(app._setup_tab.values())
+        assert mapping["LLM_API_KEY"] == "k"
+        assert "locked" in app._status_bar.dump()
+    finally:
+        app.destroy()
+
+
+def test_the_env_read_warning_clears_once_env_is_written_again(tmp_path):
+    """A successful autosave proves the file is usable again; keeping the
+    startup warning after that tells the operator their settings are broken
+    when they are not."""
+    if os.geteuid() == 0:
+        pytest.skip("root ignores permission bits")
+
+    bootstrap(tmp_path)
+    env = tmp_path / ".env"
+    env.chmod(0o000)
+    try:
+        app = make_app(tmp_path)
+    finally:
+        env.chmod(0o600)
+    try:
+        assert ".env" in app._status_bar.dump()
+        app._setup_tab.set_values({"LLM_PROVIDER": "gemini", "LLM_API_KEY": "k"})
+        app._save_fields()
+        assert ".env" not in app._status_bar.dump()
+    finally:
+        app.destroy()
+
+
+def test_editing_a_setting_while_the_bot_runs_says_a_restart_is_needed(tmp_path):
+    app = make_app(tmp_path)
+    try:
+        app._handle_status(BotState(RUNNING))
+        app._setup_tab._vars["LLM_MODEL"].set("some-other-model")
+        assert "restart" in app._status_bar.dump().lower()
+    finally:
+        app.destroy()
+
+
+def test_toggling_the_checkbox_while_running_does_not_ask_for_a_restart(tmp_path):
+    app = make_app(tmp_path)
+    try:
+        app._handle_status(BotState(RUNNING))
+        app._setup_tab._vars["HUMAN_IN_THE_LOOP"].set("true")
+        assert "restart" not in app._status_bar.dump().lower()
+    finally:
+        app.destroy()
+
+
+def test_editing_the_denied_reply_reaches_a_live_bot_without_a_restart(tmp_path):
+    from rangecontrol.bot.mode import ModeSwitch
+
+    app = make_app(tmp_path)
+    try:
+        class LiveBot:
+            mode = ModeSwitch(False)
+            denied_text = "old"
+        live = LiveBot()
+        app._controller._bot = live
+        app._handle_status(BotState(RUNNING))
+        app._setup_tab._vars["HUMAN_IN_THE_LOOP"].set("true")  # unlocks the box
+        # Typed, not set_values(): programmatic loads are deliberately not
+        # edits, and a Text widget reports typing via a queued <<Modified>>.
+        widget = app._setup_tab.entry_for("HITL_DENIED_TEXT")
+        widget.delete("1.0", "end")
+        widget.insert("1.0", "new wording")
+        app.update()
+        assert live.denied_text == "new wording"
+        assert "restart" not in app._status_bar.dump().lower()
+    finally:
+        app._controller._bot = None
+        app.destroy()
+
+
+def test_the_window_opens_tall_enough_to_show_every_control(tmp_path):
+    """The fixed 980x700 stopped fitting once the form gained fields; the
+    buttons at the bottom were off-screen until the operator dragged the
+    window taller. The opening size must follow the content."""
+    from rangecontrol.gui.app import _HEIGHT_SLACK, _REFIT_DELAY_MS
+
+    app = make_app(tmp_path)
+    try:
+        app.update()  # map the window so the hints wrap to their real width
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:  # let the second measuring pass run
+            app.update()
+            time.sleep(_REFIT_DELAY_MS / 1000)
+            if time.monotonic() > deadline - 1.5:
+                break
+        width, height = (int(v) for v in app.geometry().split("+")[0].split("x"))
+        # A headless test screen can be smaller than the content; the window
+        # is then capped to the screen, which is the most it can do.
+        wanted_height = min(
+            app.winfo_reqheight() + _HEIGHT_SLACK, app.winfo_screenheight() - 80
+        )
+        assert height >= wanted_height
+        assert width >= min(app.winfo_reqwidth(), app.winfo_screenwidth())
+        min_width, min_height = app.minsize()
+        assert min_height >= wanted_height
     finally:
         app.destroy()

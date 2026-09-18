@@ -6,6 +6,7 @@ can be exercised without a gateway connection.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -18,12 +19,18 @@ from discord import app_commands
 from rangecontrol.advisor.engine import Advisor
 from rangecontrol.advisor.models import Advice
 from rangecontrol.audit.log import AuditLog
+from rangecontrol.bot.diagnostics import (
+    ALLOWED_CHANNEL_PERMISSIONS,
+    WHITE_CELL_PERMISSIONS,
+    ChannelCheck,
+    check_channel,
+)
 from rangecontrol.bot.mode import ModeSwitch
 from rangecontrol.bot.pending import PendingRegistry, PendingRequest
 from rangecontrol.bot.ratelimit import RateLimiter
 from rangecontrol.bot.responder import DISCORD_LIMIT, _truncate, format_public
 from rangecontrol.bot.whitecell import build_embed
-from rangecontrol.config import Config
+from rangecontrol.config import DEFAULT_HITL_DENIED_TEXT, Config
 
 logger = logging.getLogger(__name__)
 
@@ -38,11 +45,10 @@ HELD_TEXT = (
     "Logged with the change board — I'll come back to you on this one shortly."
 )
 
-# Fixed text. Never derived from the ruling, so a denial can carry nothing
-# about what the change would have touched.
-HITL_DENIED_TEXT = (
-    "That request has been denied to retain range integrity."
-)
+# The built-in denial wording. The live value is ``bot.denied_text``: fixed
+# per bot and editable by the white cell, never derived from the ruling, so
+# a denial can carry nothing about what the change would have touched.
+HITL_DENIED_TEXT = DEFAULT_HITL_DENIED_TEXT
 
 _MENTION = re.compile(r"<@!?\d+>")
 
@@ -50,15 +56,22 @@ _MENTION = re.compile(r"<@!?\d+>")
 # ruling mid-exercise. When it's unreachable, rulings still go out publicly
 # with zero oversight and the only prior signal was a traceback nobody
 # watches. This has to be impossible to miss on the console at startup, the
-# one moment an operator is actually looking.
+# one moment an operator is actually looking -- and it has to say *why*, so
+# the operator fixes the right thing instead of guessing between a wrong ID,
+# a private channel, and a missing permission.
 _WHITE_CELL_BANNER = """
 ================================================================
- WHITE CELL CHANNEL UNREACHABLE (channel_id=%s)
+ WHITE CELL CHANNEL UNUSABLE (channel_id=%s)
+ Problem: %s
  Oversight posting is NOT working: rulings will still be answered
  publicly, but no one is reviewing them until this is fixed.
- Check WHITE_CELL_CHANNEL_ID and the bot's permissions on that
- channel, then restart.
+ Fix the channel or the bot's permissions, then restart.
 ================================================================"""
+
+NOT_ALLOWED_HERE_TEXT = (
+    "RangeControl isn't enabled in this channel. Ask in one of the "
+    "channels set up for change requests."
+)
 
 
 def should_handle(channel_id: int, allowed: tuple[int, ...]) -> bool:
@@ -78,6 +91,7 @@ class BotLike(Protocol):
     limiter: RateLimiter
     mode: ModeSwitch
     pending: PendingRegistry
+    denied_text: str
 
     async def post_white_cell(
         self,
@@ -122,8 +136,12 @@ async def handle_question(
         )
         return RATE_LIMIT_TEXT
 
+    # The provider SDKs are synchronous and a ruling over a large range can
+    # take tens of seconds. On the event loop thread that would stall the
+    # gateway heartbeat (discord.py drops the connection after a long enough
+    # stall) and queue every other question and reaction behind it.
     started = time.monotonic()
-    advice = bot.advisor.advise(question)
+    advice = await asyncio.to_thread(bot.advisor.advise, question)
     latency_ms = int((time.monotonic() - started) * 1000)
 
     public_text = format_public(advice)
@@ -238,7 +256,8 @@ async def release_pending(
         text = _truncate(f"{mention} {request.public_text}", DISCORD_LIMIT)
         kind = "hitl_approved"
     else:
-        text = _truncate(f"{mention} {HITL_DENIED_TEXT}", DISCORD_LIMIT)
+        denied = bot.denied_text.strip() or HITL_DENIED_TEXT
+        text = _truncate(f"{mention} {denied}", DISCORD_LIMIT)
         kind = "hitl_denied"
 
     # The audit entry must exist even when delivery fails. A contested
@@ -290,8 +309,12 @@ class RangeControlBot(discord.Client):
         self.audit = audit
         self.limiter = limiter or RateLimiter()
         self.mode = ModeSwitch(config.human_in_the_loop)
+        # A plain attribute, reassigned whole from the GUI thread: a str
+        # swap is atomic under the GIL, and release_pending reads it once.
+        self.denied_text = config.hitl_denied_text
         self.pending = PendingRegistry(on_change=on_pending_change)
         self._on_error = on_error
+        self._channels_checked = False
         self.tree = app_commands.CommandTree(self)
         self._register_commands()
 
@@ -309,22 +332,35 @@ class RangeControlBot(discord.Client):
         @self.tree.command(name="rc", description="Ask whether a change is authorized")
         @app_commands.describe(question="The change you want to make")
         async def rc(interaction: discord.Interaction, question: str) -> None:
-            if not should_handle(interaction.channel_id, self.config.allowed_channel_ids):
-                return
-            await interaction.response.defer(thinking=True)
-            reply = await handle_question(
-                self,
-                question=question,
-                user_id=interaction.user.id,
-                user_name=str(interaction.user),
-                channel_id=interaction.channel_id,
-                channel_name=getattr(interaction.channel, "name", "unknown"),
+            await self.handle_slash(interaction, question)
+
+    async def handle_slash(self, interaction, question: str) -> None:
+        """Answer a /rc invocation.
+
+        A channel outside the allowlist gets a private one-liner rather than
+        silence: an unanswered interaction makes Discord display "The
+        application did not respond", which looks like an outage to the
+        blue team and generates support traffic for the white cell.
+        """
+        if not should_handle(interaction.channel_id, self.config.allowed_channel_ids):
+            await interaction.response.send_message(
+                NOT_ALLOWED_HERE_TEXT, ephemeral=True
             )
-            await interaction.followup.send(reply)
+            return
+        await interaction.response.defer(thinking=True)
+        reply = await handle_question(
+            self,
+            question=question,
+            user_id=interaction.user.id,
+            user_name=str(interaction.user),
+            channel_id=interaction.channel_id,
+            channel_name=getattr(interaction.channel, "name", "unknown"),
+        )
+        await interaction.followup.send(reply)
 
     async def setup_hook(self) -> None:
         # Command definitions do not change between restarts, so a failed sync
-        # is not worth refusing to start over — Discord rate-limits application
+        # is not worth refusing to start over -- Discord rate-limits application
         # command syncs, and a crash-looping process would hit that ceiling
         # exactly when the bot is already unstable. Mentions keep working, and
         # previously-registered slash commands stay registered.
@@ -333,29 +369,62 @@ class RangeControlBot(discord.Client):
         except Exception:  # noqa: BLE001 - never block startup on a sync failure
             logger.exception("slash command sync failed; continuing")
 
-        # Check the white cell channel once, right now, while an operator is
-        # still watching the startup console. A wrong ID or a missing
-        # permission otherwise surfaces only as a per-ruling
-        # logger.exception nobody is tailing. Do not refuse to start on
-        # failure: a bot that serves the exercise without oversight is
-        # better than no bot mid-exercise — wrap this so it can never
-        # prevent boot.
-        try:
-            channel = self.get_channel(self.config.white_cell_channel_id)
-            if channel is None:
-                channel = await self.fetch_channel(self.config.white_cell_channel_id)
-        except Exception:  # noqa: BLE001 - a startup check must never block boot
-            logger.error(_WHITE_CELL_BANNER, self.config.white_cell_channel_id)
-            # The design spec calls for this to become "a persistent red
-            # bar" -- a logger.error alone lands only in ConsoleTab.append_log,
-            # a line that scrolls away with everything else. This is the
-            # actual wire to the GUI's status bar (see gui/events.py's ERROR
-            # kind and StatusBar.set_warning).
-            self.report_error(
-                f"White cell channel unreachable (channel_id="
-                f"{self.config.white_cell_channel_id}). Rulings are still "
-                "being answered publicly with no oversight until this is fixed."
+    async def on_ready(self) -> None:
+        # READY fires again after every gateway resume; the channels have not
+        # changed, and re-posting the banner would bury real log lines.
+        if self._channels_checked:
+            return
+        self._channels_checked = True
+        await self.verify_channels()
+
+    async def verify_channels(self) -> None:
+        """Check every configured channel once, while an operator is watching.
+
+        Runs after READY rather than in ``setup_hook`` so that ``guild.me``
+        exists and the bot's effective permissions can be computed. A wrong
+        ID, a private channel the bot is not in, and a missing Embed Links
+        permission all used to surface as the same "unreachable" banner, or
+        not at all until the first ruling failed. Never refuses to start: a
+        bot serving the exercise without oversight beats no bot mid-exercise.
+        """
+        for channel_id in self.config.allowed_channel_ids:
+            check = await check_channel(self, channel_id, ALLOWED_CHANNEL_PERMISSIONS)
+            if check.ok:
+                logger.info("Allowed channel %s verified.", check.describe())
+                continue
+            text = (
+                f"Allowed channel {check.describe()} is unusable: {check.problem} "
+                "Questions asked there will be ignored."
             )
+            logger.warning(text)
+            self.report_error(text)
+
+        white = await check_channel(
+            self, self.config.white_cell_channel_id, WHITE_CELL_PERMISSIONS
+        )
+        if white.ok:
+            suffix = f" ({white.note})" if white.note else ""
+            logger.info(
+                "White cell channel %s verified; audit embeds and approval "
+                "reactions will post there.%s",
+                white.describe(),
+                suffix,
+            )
+            return
+        self._report_white_cell_problem(white)
+
+    def _report_white_cell_problem(self, check: ChannelCheck) -> None:
+        logger.error(_WHITE_CELL_BANNER, check.channel_id, check.problem)
+        # The design spec calls for this to become "a persistent red bar":
+        # a logger.error alone lands only in ConsoleTab.append_log, a line
+        # that scrolls away with everything else. This is the actual wire to
+        # the GUI's status bar (see gui/events.py's ERROR kind and
+        # StatusBar.set_warning).
+        self.report_error(
+            f"White cell channel {check.describe()} is unusable: {check.problem} "
+            "Rulings are still being answered publicly with no oversight "
+            "until this is fixed."
+        )
 
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot or self.user not in message.mentions:

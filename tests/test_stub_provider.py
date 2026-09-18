@@ -18,7 +18,13 @@ def test_records_call_arguments():
     stub = StubProvider(completions=["x"])
     stub.complete(system="sys", user="usr", schema={"type": "object"}, max_tokens=42)
     assert stub.calls == [
-        {"system": "sys", "user": "usr", "schema": {"type": "object"}, "max_tokens": 42}
+        {
+            "system": "sys",
+            "user": "usr",
+            "schema": {"type": "object"},
+            "max_tokens": 42,
+            "effort": None,
+        }
     ]
 
 

@@ -11,7 +11,7 @@ import re
 
 from rangecontrol.advisor.models import GateResult, GateVerdict, MissingDetail
 from rangecontrol.advisor.prompts import GATE_SCHEMA, GATE_SYSTEM_PROMPT
-from rangecontrol.llm.base import LLMError, Provider
+from rangecontrol.llm.base import EFFORT_MEDIUM, LLMError, Provider
 
 _VALID = {
     GateVerdict.CHANGE_REQUEST,
@@ -61,6 +61,9 @@ def classify(question: str, provider: Provider) -> GateResult:
         user=f"Message:\n{question.strip()}",
         schema=GATE_SCHEMA,
         max_tokens=GATE_MAX_TOKENS,
+        # A classification with judgement in it, not a deep derivation:
+        # medium keeps reasoning well inside GATE_MAX_TOKENS.
+        effort=EFFORT_MEDIUM,
     )
     payload = parse_json_object(raw)
 

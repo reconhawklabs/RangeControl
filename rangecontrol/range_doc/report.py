@@ -37,6 +37,8 @@ class IngestReport:
     index_rows: int
     inject_count: int
     context_chars: int
+    # Files whose text was cut at the per-file ceiling (see discovery).
+    truncated: tuple[str, ...] = ()
 
     def approx_context_tokens(self) -> int:
         """Rough token estimate for the per-question context (~4 chars/token)."""
@@ -52,6 +54,7 @@ class IngestReport:
         """
         return bool(
             self.unreadable
+            or self.truncated
             or self.range_md_gaps
             or self.index_rows == 0
             or self.inject_count == 0
@@ -89,6 +92,7 @@ def build_report(corpus: Corpus, range_md: str, generated: bool) -> IngestReport
         range_md_gaps=missing_sections(range_md),
         index_rows=_count_data_rows(index),
         inject_count=len(_INJECT_HEADING.findall(catalog)),
+        truncated=tuple(d.path for d in corpus.truncated_docs()),
     )
 
 
@@ -111,6 +115,14 @@ def format_report(report: IngestReport) -> str:
         lines.append("")
         lines.append(f"Could not read {len(report.unreadable)} file(s):")
         lines.extend(f"  - {path}: {reason}" for path, reason in report.unreadable)
+
+    if report.truncated:
+        lines.append("")
+        lines.append(
+            f"WARNING — {len(report.truncated)} file(s) were too large and only "
+            "their beginning was used:"
+        )
+        lines.extend(f"  - {path}" for path in report.truncated)
 
     if report.range_md_gaps:
         lines.append("")

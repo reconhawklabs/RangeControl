@@ -42,6 +42,7 @@ class FakeBot:
         self.audit = AuditLog(tmp_path)
         self.limiter = RateLimiter()
         self.mode = ModeSwitch(hitl)
+        self.denied_text = HITL_DENIED_TEXT
         self.pending = PendingRegistry()
         self.white_cell_posts = []
         self.sent = []
@@ -504,3 +505,14 @@ async def test_a_failed_add_reaction_still_holds_and_logs(tmp_path, caplog):
     assert result == 888
     assert len(bot.pending) == 1
     assert "reaction" in caplog.text.lower()
+
+
+async def test_denial_uses_the_bots_configured_reply(tmp_path):
+    """The white cell can reword the denial in the GUI; the ruling itself
+    still never leaks into it because the text is fixed per bot, not
+    derived from the ruling."""
+    bot = FakeBot(Advice(kind="ruling", public_text=RULING.public_response, ruling=RULING), hitl=True, tmp_path=tmp_path)
+    bot.denied_text = "Change board says no for now."
+    await handle_question(bot, question="block 10.0.0.1", user_id=1, user_name="u", channel_id=42, channel_name="ops")
+    await release_pending(bot, approval_message_id=555, emoji=DENY_EMOJI)
+    assert bot.sent == [(42, "<@1> Change board says no for now.")]

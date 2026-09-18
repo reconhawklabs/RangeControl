@@ -15,7 +15,7 @@ hiddenimports = []
 # whose OpenSSL CA paths do not exist on Fedora/RHEL/Arch, so the bundled
 # cacert.pem is the only CA store those platforms will find.
 for package in ("anthropic", "google.genai", "discord", "pypdf", "openpyxl",
-                "docx", "certifi"):
+                "docx", "pptx", "PIL", "certifi"):
     pkg_datas, pkg_binaries, pkg_hidden = collect_all(package)
     datas += pkg_datas
     binaries += pkg_binaries
@@ -27,7 +27,7 @@ a = Analysis(
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
-    excludes=["pytest", "_pytest", "matplotlib", "numpy", "PIL"],
+    excludes=["pytest", "_pytest", "matplotlib", "numpy"],
     noarchive=False,
 )
 

@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading
 
-from rangecontrol.llm.base import LLMError
+from rangecontrol.llm.base import LLMError, brief_error
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,21 @@ _CACHE_TTL = "3600s"
 _UNSUPPORTED_SCHEMA_KEYS = frozenset(
     {"additionalProperties", "additional_properties", "$schema"}
 )
+
+
+# Range material describes planned intrusions and carries dumped credentials;
+# Gemini's default safety thresholds block responses about it outright. Only
+# the highest-probability harm is blocked, matching the sibling Anthropic
+# adapter's use of server-side refusal fallbacks.
+_SAFETY_SETTINGS = [
+    {"category": category, "threshold": "BLOCK_ONLY_HIGH"}
+    for category in (
+        "HARM_CATEGORY_DANGEROUS_CONTENT",
+        "HARM_CATEGORY_HARASSMENT",
+        "HARM_CATEGORY_HATE_SPEECH",
+        "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+    )
+]
 
 
 class _RequestFailed(LLMError):
@@ -70,6 +86,11 @@ class GeminiProvider:
         self._cache_name: str | None = None
         self._cache_key: str | None = None
         self._caching_unavailable = False
+        # Rulings run on worker threads, so two questions can reach this
+        # provider at once. The handle is created under a lock so they
+        # share one upload of the standing context instead of racing into
+        # two.
+        self._cache_lock = threading.Lock()
         if client is not None:
             self._client = client
         else:
@@ -84,8 +105,15 @@ class GeminiProvider:
         user: str,
         schema: dict | None = None,
         max_tokens: int = 2000,
+        effort: str | None = None,
     ) -> str:
-        config: dict = {"max_output_tokens": max_tokens}
+        # ``effort`` is accepted for protocol parity and left to Gemini's own
+        # dynamic thinking: its budget parameter is model-specific and a
+        # value a model rejects would cost every ruling.
+        config: dict = {
+            "max_output_tokens": max_tokens,
+            "safety_settings": list(_SAFETY_SETTINGS),
+        }
         if schema is not None:
             config["response_mime_type"] = "application/json"
             config["response_schema"] = _to_gemini_schema(schema)
@@ -103,8 +131,10 @@ class GeminiProvider:
             # A cache can expire or be deleted mid-exercise. That must never cost
             # a ruling, so drop the handle and answer inline this once.
             logger.warning("Gemini cached context unusable; retrying inline")
-            self._cache_name = None
-            self._cache_key = None
+            with self._cache_lock:
+                if self._cache_name == cached:
+                    self._cache_name = None
+                    self._cache_key = None
             # A fresh dict, not a mutation: the first config was already handed
             # to the SDK, and editing it in place would rewrite that call's
             # arguments underneath it.
@@ -123,6 +153,12 @@ class GeminiProvider:
             return None
 
         key = hashlib.sha256(system.encode("utf-8")).hexdigest()
+        with self._cache_lock:
+            return self._cached_handle_locked(system, key)
+
+    def _cached_handle_locked(self, system: str, key: str) -> str | None:
+        if self._caching_unavailable:
+            return None
         if self._cache_name is not None and self._cache_key == key:
             return self._cache_name
 
@@ -150,14 +186,24 @@ class GeminiProvider:
         logger.info("Gemini standing context cached (%s)", name)
         return name
 
-    def describe_image(self, *, data: bytes, mime_type: str, prompt: str) -> str:
+    def describe_image(
+        self,
+        *,
+        data: bytes,
+        mime_type: str,
+        prompt: str,
+        effort: str | None = None,
+    ) -> str:
         return self._send(
             contents=[{"inline_data": {"mime_type": mime_type, "data": data}}, prompt],
             # Matches the Anthropic sibling's describe_image budget: on a
             # thinking-by-default model the cap covers reasoning as well as
             # the description, so a tight number reads as truncation rather
             # than a short answer.
-            config={"max_output_tokens": 4000},
+            config={
+                "max_output_tokens": 16000,
+                "safety_settings": list(_SAFETY_SETTINGS),
+            },
         )
 
     def _send(self, *, contents, config: dict) -> str:
@@ -167,7 +213,7 @@ class GeminiProvider:
             )
         except Exception as exc:  # noqa: BLE001 - deliberately wrap every SDK failure
             raise _RequestFailed(
-                f"Gemini request failed: {type(exc).__name__}"
+                f"Gemini request failed: {brief_error(exc)}"
             ) from exc
 
         # Response parsing sits inside the boundary too: base.Provider promises

@@ -26,7 +26,7 @@ from rangecontrol.ingest.corpus import Corpus
 from rangecontrol.ingest.discovery import build_corpus
 from rangecontrol.llm.base import LLMError, Provider
 from rangecontrol.llm.factory import build_gate_provider, build_provider
-from rangecontrol.gui.paths import bundle_root, is_frozen
+from rangecontrol.gui.paths import app_home, bundle_root, is_frozen
 from rangecontrol.pregen import cache_put, cache_status, format_status
 from rangecontrol.purge import inspect_existing, prompt_purge
 from rangecontrol.range_doc.generator import generate_range_md, write_range_md
@@ -164,8 +164,11 @@ def run_bot(config: Config, advisor: Advisor, audit: AuditLog) -> None:  # pragm
     from rangecontrol.bot.client import RangeControlBot
 
     try:
+        # log_handler=None: discord.py's run() would otherwise install a
+        # second root handler next to basicConfig's and print every line
+        # twice.
         RangeControlBot(config=config, advisor=advisor, audit=audit).run(
-            config.discord_bot_token
+            config.discord_bot_token, log_handler=None
         )
     except discord.LoginFailure as exc:
         raise RuntimeError(
@@ -463,11 +466,19 @@ def main(argv: list[str] | None = None) -> int:
             print(f"OK: {provider_name} provider constructed.")
         return 0
 
-    # Load .env if present; real environment variables always win.
-    load_dotenv(override=False)
+    # Load .env if present; real environment variables always win. Read
+    # from the app home (next to the binary when frozen) so the CLI and the
+    # window agree on which .env is "the" configuration, whatever the
+    # current directory happens to be. interpolate=False matches the GUI's
+    # own parser: an EXTRA_INSTRUCTIONS containing "${...}" is literal text
+    # to the operator, not a shell expansion.
+    home = app_home()
+    load_dotenv(home / ".env", override=False, interpolate=False)
 
     try:
-        config = load_config()
+        config = load_config(
+            {**os.environ, "RANGE_DIR": os.environ.get("RANGE_DIR") or str(home)}
+        )
     except ConfigError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 1
