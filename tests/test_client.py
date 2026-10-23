@@ -6,10 +6,8 @@ from unittest.mock import AsyncMock
 
 import discord
 
-import pytest
-
 from rangecontrol.advisor.engine import Advisor
-from rangecontrol.advisor.models import GateVerdict
+from rangecontrol.advisor.models import Advice, GateVerdict
 from rangecontrol.advisor.prompts import ERROR_TEXT
 from rangecontrol.audit.log import AuditLog
 from rangecontrol.bot.diagnostics import WHITE_CELL_PERMISSIONS
@@ -24,6 +22,7 @@ from rangecontrol.bot.mode import ModeSwitch
 from rangecontrol.bot.pending import PendingRegistry
 from rangecontrol.bot.ratelimit import RateLimiter
 from rangecontrol.config import DEFAULT_HITL_DENIED_TEXT, load_config
+from rangecontrol.llm.base import LLMError
 from tests.support.stub_provider import StubProvider
 
 BASE_ENV = {
@@ -33,9 +32,7 @@ BASE_ENV = {
     "WHITE_CELL_CHANNEL_ID": "12345",
 }
 
-
-def config_for(tmp_path):
-    return load_config({**BASE_ENV, "RANGE_DIR": str(tmp_path)})
+PUBLIC = "No. That is waiting on the change board."
 
 
 class FakeBot:
@@ -78,11 +75,16 @@ def gate_reply(verdict=GateVerdict.CHANGE_REQUEST):
     return json.dumps({"verdict": verdict, "reason": "r"})
 
 
-def ruling_reply():
+# The reply reviewer runs on the ruling provider, right after the ruling.
+SCREEN_CLEAN = json.dumps({"discloses": False, "reason": ""})
+SCREEN_DISCLOSES = json.dumps({"discloses": True, "reason": "names a host"})
+
+
+def ruling_reply(public=PUBLIC):
     return json.dumps(
         {
             "verdict": "DENIED",
-            "public_response": "No. A partner service depends on it.",
+            "public_response": public,
             "internal_reason": "breaks MSEL-01",
             "impacted": ["MSEL-01"],
             "confidence": "high",
@@ -100,12 +102,9 @@ def build(tmp_path, gate_completions, ruling_completions=None, limiter=None):
     return FakeBot(advisor, AuditLog(tmp_path), limiter or RateLimiter(100, 60))
 
 
-@pytest.mark.parametrize(
-    "channel,allowed,expected",
-    [(5, (), True), (5, (5, 9), True), (5, (9,), False)],
-)
-def test_channel_allowlist(channel, allowed, expected):
-    assert should_handle(channel, allowed) is expected
+def audit_records(bot):
+    text = bot.audit.path_for_today().read_text(encoding="utf-8")
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
 async def ask(bot, question="can we block 77.232.11.2"):
@@ -119,163 +118,16 @@ async def ask(bot, question="can we block 77.232.11.2"):
     )
 
 
-async def test_returns_the_public_reply(tmp_path):
-    bot = build(tmp_path, [gate_reply()], [ruling_reply()])
-    assert await ask(bot) == "No. A partner service depends on it."
+async def boom(*args, **kwargs):
+    raise RuntimeError("channel not found")
 
 
-async def test_posts_to_the_white_cell(tmp_path):
-    bot = build(tmp_path, [gate_reply()], [ruling_reply()])
-    await ask(bot)
-    assert len(bot.white_cell_posts) == 1
-    advice, user_name, channel_name, question = bot.white_cell_posts[0]
-    assert advice.ruling.internal_reason == "breaks MSEL-01"
-    assert user_name == "blue-lead"
-    assert channel_name == "ops"
-
-
-async def test_public_reply_never_carries_internal_detail(tmp_path):
-    bot = build(tmp_path, [gate_reply()], [ruling_reply()])
-    reply = await ask(bot)
-    assert "MSEL-01" not in reply
-    assert "DC-VULCAN" not in reply
-
-
-async def test_writes_an_audit_record(tmp_path):
-    bot = build(tmp_path, [gate_reply()], [ruling_reply()])
-    await ask(bot)
-    line = bot.audit.path_for_today().read_text(encoding="utf-8").strip()
-    record = json.loads(line)
-    assert record["verdict"] == "DENIED"
-    assert record["latency_ms"] >= 0
-
-
-async def test_deflections_are_audited_too(tmp_path):
-    bot = build(tmp_path, [gate_reply(GateVerdict.NOT_A_CHANGE_REQUEST)])
-    await ask(bot, "what is behind that firewall?")
-    record = json.loads(bot.audit.path_for_today().read_text(encoding="utf-8").strip())
-    assert record["kind"] == "deflection"
-
-
-async def test_rate_limited_user_gets_a_notice_and_no_model_call(tmp_path):
-    limiter = RateLimiter(max_calls=1, per_seconds=60)
-    bot = build(tmp_path, [gate_reply(), gate_reply()], [ruling_reply()], limiter=limiter)
-    await ask(bot)
-    assert await ask(bot) == RATE_LIMIT_TEXT
-
-
-async def test_rate_limit_notice_is_not_an_approval(tmp_path):
-    limiter = RateLimiter(max_calls=0, per_seconds=60)
-    bot = build(tmp_path, [], limiter=limiter)
-    reply = await ask(bot)
-    assert "approv" not in reply.lower()
-
-
-async def test_rate_limited_request_is_still_audited(tmp_path):
-    """Denial probing is the behavior most likely to trip the limiter — it
-    must not be exactly what goes missing from the audit trail."""
-    limiter = RateLimiter(max_calls=0, per_seconds=60)
-    bot = build(tmp_path, [], limiter=limiter)
-    await ask(bot, "can we block 198.51.100.7")
-    line = bot.audit.path_for_today().read_text(encoding="utf-8").strip()
-    record = json.loads(line)
-    assert record["kind"] == "rate_limited"
-    assert record["latency_ms"] == 0
-    assert record["question"] == "can we block 198.51.100.7"
-
-
-async def test_provider_failure_yields_the_error_text(tmp_path):
-    from rangecontrol.llm.base import LLMError
-
-    advisor = Advisor(
-        provider=StubProvider(),
-        gate_provider=StubProvider(error=LLMError("down")),
-        range_md="r",
-        corpus_text="c",
+def make_bot(tmp_path, errors=None, **env):
+    config = load_config({**BASE_ENV, "RANGE_DIR": str(tmp_path), **env})
+    on_error = errors.append if errors is not None else None
+    return RangeControlBot(
+        config, advisor=object(), audit=AuditLog(tmp_path), on_error=on_error
     )
-    bot = FakeBot(advisor, AuditLog(tmp_path), RateLimiter(100, 60))
-    assert await ask(bot) == ERROR_TEXT
-
-
-async def test_white_cell_post_failure_does_not_break_the_reply(tmp_path):
-    bot = build(tmp_path, [gate_reply()], [ruling_reply()])
-
-    async def boom(*args, **kwargs):
-        raise RuntimeError("channel not found")
-
-    bot.post_white_cell = boom
-    assert await ask(bot) == "No. A partner service depends on it."
-
-
-async def test_white_cell_post_failure_logs_who_and_what(tmp_path, caplog):
-    bot = build(tmp_path, [gate_reply()], [ruling_reply()])
-
-    async def boom(*args, **kwargs):
-        raise RuntimeError("channel not found")
-
-    bot.post_white_cell = boom
-    with caplog.at_level(logging.ERROR):
-        await ask(bot, "can we block 77.232.11.2")
-
-    assert "blue-lead" in caplog.text
-    assert "ops" in caplog.text
-    assert "can we block 77.232.11.2" in caplog.text
-
-
-# -- I1: a held ruling must be marked held in the audit trail ----------------
-
-
-async def test_a_held_ruling_is_marked_held_in_the_audit(tmp_path):
-    """Before this fix, the audit record was written before the hold
-    decision existed, so it always looked like the ruling text went out --
-    even though the blue team actually got HELD_TEXT."""
-    bot = build(tmp_path, [gate_reply()], [ruling_reply()])
-    bot.mode.set(True)
-
-    async def fake_post_white_cell(advice, **kwargs):
-        return 999  # pretend the white cell post succeeded
-
-    bot.post_white_cell = fake_post_white_cell
-
-    reply = await ask(bot)
-    assert reply == HELD_TEXT
-
-    record = json.loads(bot.audit.path_for_today().read_text(encoding="utf-8").strip())
-    assert record["held"] is True
-    # The audit record still carries the real ruling (for the eventual
-    # after-action review), it is just now labelled as not yet delivered.
-    assert record["public_response"] == "No. A partner service depends on it."
-    assert record["public_response"] != reply
-
-
-async def test_a_ruling_answered_immediately_is_not_marked_held(tmp_path):
-    bot = build(tmp_path, [gate_reply()], [ruling_reply()])  # HITL off by default
-    await ask(bot)
-    record = json.loads(bot.audit.path_for_today().read_text(encoding="utf-8").strip())
-    assert "held" not in record
-
-
-# -- I2: a failed white cell post under HITL must raise an ERROR, not just --
-# -- a log line that scrolls away --------------------------------------------
-
-
-async def test_hitl_fail_open_is_not_marked_held_and_reports_an_error(tmp_path):
-    """FakeBot.post_white_cell returns None unconditionally, so enabling HITL
-    here reproduces "the post failed" without needing to fake an exception:
-    the reply must go out unreviewed (fail-open, matching HITL off), never
-    marked held, and the operator must be told via report_error -- the wire
-    this test proves is actually connected."""
-    bot = build(tmp_path, [gate_reply()], [ruling_reply()])
-    bot.mode.set(True)
-
-    reply = await ask(bot)
-    assert reply == "No. A partner service depends on it."  # answered, unreviewed
-
-    record = json.loads(bot.audit.path_for_today().read_text(encoding="utf-8").strip())
-    assert "held" not in record
-
-    assert bot.errors
-    assert "no review" in bot.errors[0].lower()
 
 
 def _forbidden():
@@ -292,161 +144,17 @@ def _text_channel(name="white-cell", **denied):
     )
 
 
-async def test_ready_reports_an_error_when_the_white_cell_is_unreachable(tmp_path):
-    """The white-cell-unreachable condition must reach the ERROR wire, not
-    only the logger.error banner that scrolls off the console feed -- and it
-    must say why, so the operator can fix the right thing."""
-    errors = []
-    bot = RangeControlBot(
-        config_for(tmp_path), advisor=object(), audit=AuditLog(tmp_path),
-        on_error=errors.append,
-    )
-    bot.get_channel = lambda channel_id: None
-    bot.fetch_channel = AsyncMock(side_effect=_forbidden())
-
-    await bot.on_ready()  # must not raise -- startup proceeds regardless
-
-    assert errors
-    assert "12345" in errors[0]
-    assert "cannot see" in errors[0]
+# -- the question pipeline ----------------------------------------------------
 
 
-async def test_ready_reports_nothing_when_the_white_cell_resolves(tmp_path):
-    errors = []
-    bot = RangeControlBot(
-        config_for(tmp_path), advisor=object(), audit=AuditLog(tmp_path),
-        on_error=errors.append,
-    )
-    bot.get_channel = lambda channel_id: _text_channel()
-    bot.fetch_channel = AsyncMock()
+async def test_only_allowlisted_channels_are_served(tmp_path):
+    """An empty allowlist serves every channel. A slash command outside a
+    non-empty one gets a private refusal: silently ignoring it makes Discord
+    show 'The application did not respond', which reads as a crash."""
+    for channel, allowed, expected in [(5, (), True), (5, (5, 9), True), (5, (9,), False)]:
+        assert should_handle(channel, allowed) is expected, (channel, allowed)
 
-    await bot.on_ready()
-
-    assert errors == []
-
-
-async def test_ready_reports_missing_posting_permissions(tmp_path):
-    """Seeing the channel is not enough: without Embed Links every ruling's
-    audit embed would fail, one logger.exception at a time."""
-    errors = []
-    bot = RangeControlBot(
-        config_for(tmp_path), advisor=object(), audit=AuditLog(tmp_path),
-        on_error=errors.append,
-    )
-    bot.get_channel = lambda channel_id: _text_channel(embed_links=False)
-
-    await bot.on_ready()
-
-    assert errors and "Embed Links" in errors[0]
-
-
-async def test_ready_warns_about_an_allowed_channel_the_bot_cannot_read(tmp_path):
-    errors = []
-    config = load_config(
-        {**BASE_ENV, "RANGE_DIR": str(tmp_path), "ALLOWED_CHANNEL_IDS": "777"}
-    )
-    bot = RangeControlBot(
-        config, advisor=object(), audit=AuditLog(tmp_path), on_error=errors.append,
-    )
-    channels = {12345: _text_channel(), 777: _text_channel("blue-1", view_channel=False)}
-    bot.get_channel = lambda channel_id: channels.get(channel_id)
-
-    await bot.on_ready()
-
-    assert errors
-    assert "777" in errors[0]
-    assert "ignored" in errors[0]
-
-
-async def test_ready_checks_channels_only_once_across_reconnects(tmp_path):
-    bot = RangeControlBot(config_for(tmp_path), advisor=object(), audit=AuditLog(tmp_path))
-    bot.get_channel = lambda channel_id: None
-    bot.fetch_channel = AsyncMock(return_value=_text_channel())
-
-    await bot.on_ready()
-    await bot.on_ready()
-
-    bot.fetch_channel.assert_awaited_once_with(12345)
-
-
-def real_bot(tmp_path):
-    advisor = Advisor(
-        provider=StubProvider(),
-        gate_provider=StubProvider(),
-        range_md="## Protected Dependency Index\n| DC-VULCAN |",
-        corpus_text="10.77.0.0/16",
-    )
-    return RangeControlBot(config_for(tmp_path), advisor, AuditLog(tmp_path))
-
-
-async def test_ready_logs_a_banner_with_the_reason_when_unreachable(tmp_path, caplog):
-    bot = real_bot(tmp_path)
-    bot.get_channel = lambda channel_id: None
-    bot.fetch_channel = AsyncMock(side_effect=_forbidden())
-
-    with caplog.at_level(logging.ERROR):
-        await bot.on_ready()  # must not raise -- startup proceeds regardless
-
-    bot.fetch_channel.assert_awaited_once_with(12345)
-    assert "WHITE CELL" in caplog.text
-    assert "12345" in caplog.text
-    assert "cannot see" in caplog.text
-
-
-async def test_ready_confirms_the_white_cell_channel_when_it_works(tmp_path, caplog):
-    """Silence on success left operators unsure whether oversight was wired
-    up at all; a positive line names the channel that was verified."""
-    bot = real_bot(tmp_path)
-    bot.get_channel = lambda channel_id: _text_channel()
-
-    with caplog.at_level(logging.INFO):
-        await bot.on_ready()
-
-    assert "WHITE CELL" not in caplog.text
-    assert "white-cell" in caplog.text
-    assert "verified" in caplog.text.lower()
-
-
-async def test_setup_hook_does_not_block_startup_on_sync_failure(tmp_path, caplog):
-    bot = real_bot(tmp_path)
-    bot.tree.sync = AsyncMock(side_effect=RuntimeError("discord unreachable"))
-
-    await bot.setup_hook()  # must not raise
-
-
-class ThreadRecordingAdvisor:
-    """Records which thread advise() ran on."""
-
-    def __init__(self):
-        self.thread_ids = []
-
-    def advise(self, question):
-        from rangecontrol.advisor.models import Advice
-
-        self.thread_ids.append(threading.get_ident())
-        return Advice(kind="deflection", public_text="nope")
-
-
-async def test_advise_runs_off_the_event_loop_thread(tmp_path):
-    """The provider SDKs are synchronous. Running a 30-second ruling on the
-    event loop thread stalls Discord's heartbeat and every other question
-    and reaction until it returns."""
-    advisor = ThreadRecordingAdvisor()
-    bot = FakeBot(advisor, AuditLog(tmp_path), RateLimiter(100, 60))
-
-    assert await ask(bot) == "nope"
-
-    assert advisor.thread_ids == [advisor.thread_ids[0]]
-    assert advisor.thread_ids[0] != threading.get_ident()
-
-
-async def test_slash_command_in_a_disallowed_channel_gets_an_ephemeral_refusal(tmp_path):
-    """Silently ignoring the interaction makes Discord show 'The application
-    did not respond', which reads as a crash rather than a scope decision."""
-    config = load_config(
-        {**BASE_ENV, "RANGE_DIR": str(tmp_path), "ALLOWED_CHANNEL_IDS": "777"}
-    )
-    bot = RangeControlBot(config, advisor=object(), audit=AuditLog(tmp_path))
+    bot = make_bot(tmp_path, ALLOWED_CHANNEL_IDS="777")
     interaction = SimpleNamespace(
         channel_id=999,
         channel=SimpleNamespace(name="elsewhere"),
@@ -460,3 +168,214 @@ async def test_slash_command_in_a_disallowed_channel_gets_an_ephemeral_refusal(t
     interaction.response.send_message.assert_awaited_once()
     assert interaction.response.send_message.await_args.kwargs.get("ephemeral") is True
     interaction.followup.send.assert_not_awaited()
+
+
+async def test_a_ruling_is_answered_reported_and_audited_without_leaking(tmp_path):
+    bot = build(tmp_path, [gate_reply()], [ruling_reply(), SCREEN_CLEAN])
+
+    reply = await ask(bot)
+
+    assert reply == PUBLIC
+    assert "MSEL-01" not in reply
+    assert "DC-VULCAN" not in reply
+
+    [(advice, user_name, channel_name, _)] = bot.white_cell_posts
+    assert advice.ruling.internal_reason == "breaks MSEL-01"
+    assert (user_name, channel_name) == ("blue-lead", "ops")
+
+    [record] = audit_records(bot)
+    assert record["verdict"] == "DENIED"
+    assert record["internal_reason"] == "breaks MSEL-01"
+    assert record["latency_ms"] >= 0
+    assert "held" not in record  # HITL is off by default
+
+
+async def test_a_screened_draft_reaches_only_the_white_cell_and_audit(tmp_path):
+    """The reply screen swaps a disclosing draft for a fallback; the blue team
+    must never see the draft, while the reviewer and audit must see it and why."""
+    draft = "No. That would cut DC-VULCAN off from its callback."
+    bot = build(tmp_path, [gate_reply()], [ruling_reply(draft), SCREEN_DISCLOSES])
+
+    reply = await ask(bot)
+
+    assert "DC-VULCAN" not in reply
+    assert reply != draft
+
+    [(advice, _, _, _)] = bot.white_cell_posts
+    assert advice.screen_reason
+    assert advice.ruling.public_response == draft
+
+    [record] = audit_records(bot)
+    assert record["public_response"] == reply
+    assert record["model_draft"] == draft
+    assert "names a host" in record["screen_reason"]
+
+
+async def test_every_interaction_is_audited_including_rate_limited_ones(tmp_path):
+    """Denial probing is the behavior most likely to trip the limiter -- it
+    must not be exactly what goes missing from the audit trail."""
+    gate = StubProvider(completions=[gate_reply(GateVerdict.NOT_A_CHANGE_REQUEST)])
+    advisor = Advisor(
+        provider=StubProvider(), gate_provider=gate, range_md="r", corpus_text="c"
+    )
+    bot = FakeBot(advisor, AuditLog(tmp_path), RateLimiter(max_calls=1, per_seconds=60))
+
+    await ask(bot, "what is behind that firewall?")
+    reply = await ask(bot, "can we block 198.51.100.7")
+
+    assert reply == RATE_LIMIT_TEXT
+    assert "approv" not in reply.lower()
+    assert len(gate.calls) == 1  # the limited attempt never reached a model
+
+    deflection, limited = audit_records(bot)
+    assert deflection["kind"] == "deflection"
+    assert limited["kind"] == "rate_limited"
+    assert limited["question"] == "can we block 198.51.100.7"
+    assert limited["latency_ms"] == 0
+
+
+async def test_provider_failure_yields_the_error_text(tmp_path):
+    advisor = Advisor(
+        provider=StubProvider(),
+        gate_provider=StubProvider(error=LLMError("down")),
+        range_md="r",
+        corpus_text="c",
+    )
+    bot = FakeBot(advisor, AuditLog(tmp_path), RateLimiter(100, 60))
+    assert await ask(bot) == ERROR_TEXT
+
+
+async def test_advise_runs_off_the_event_loop_thread(tmp_path):
+    """The provider SDKs are synchronous. Running a 30-second ruling on the
+    event loop thread stalls Discord's heartbeat and every other question
+    and reaction until it returns."""
+
+    class ThreadRecordingAdvisor:
+        def __init__(self):
+            self.thread_ids = []
+
+        def advise(self, question):
+            self.thread_ids.append(threading.get_ident())
+            return Advice(kind="deflection", public_text="nope")
+
+    advisor = ThreadRecordingAdvisor()
+    bot = FakeBot(advisor, AuditLog(tmp_path), RateLimiter(100, 60))
+
+    assert await ask(bot) == "nope"
+    assert len(advisor.thread_ids) == 1
+    assert advisor.thread_ids[0] != threading.get_ident()
+
+
+# -- holding for the white cell ------------------------------------------------
+
+
+async def test_a_held_ruling_is_marked_held_in_the_audit(tmp_path):
+    """The audit record still carries the real ruling for the after-action
+    review, labelled as not yet delivered: the asker got HELD_TEXT."""
+    bot = build(tmp_path, [gate_reply()], [ruling_reply(), SCREEN_CLEAN])
+    bot.mode.set(True)
+
+    async def posted(advice, **kwargs):
+        return 999
+
+    bot.post_white_cell = posted
+
+    assert await ask(bot) == HELD_TEXT
+
+    [record] = audit_records(bot)
+    assert record["held"] is True
+    assert record["public_response"] == PUBLIC
+
+
+async def test_white_cell_post_failure_under_hitl_answers_directly_and_reports_it(
+    tmp_path, caplog
+):
+    """Holding with nobody able to review would strand the asker, so the reply
+    goes out unreviewed -- never marked held -- and the operator is told on the
+    ERROR wire, not only in a log line that scrolls away."""
+    bot = build(tmp_path, [gate_reply()], [ruling_reply(), SCREEN_CLEAN])
+    bot.mode.set(True)
+    bot.post_white_cell = boom
+
+    with caplog.at_level(logging.ERROR):
+        reply = await ask(bot, "can we block 77.232.11.2")
+
+    assert reply == PUBLIC
+    [record] = audit_records(bot)
+    assert "held" not in record
+    assert len(bot.errors) == 1
+    assert "no review" in bot.errors[0].lower()
+    for detail in ("blue-lead", "ops", "can we block 77.232.11.2"):
+        assert detail in caplog.text
+
+
+# -- startup ---------------------------------------------------------------------
+
+
+async def test_ready_names_why_the_white_cell_is_unreachable(tmp_path, caplog):
+    """Both the console banner and the GUI's ERROR wire must say why, so the
+    operator fixes the right thing. Startup proceeds regardless."""
+    errors = []
+    bot = make_bot(tmp_path, errors)
+    bot.get_channel = lambda channel_id: None
+    bot.fetch_channel = AsyncMock(side_effect=_forbidden())
+
+    with caplog.at_level(logging.ERROR):
+        await bot.on_ready()
+
+    assert len(errors) == 1
+    assert "12345" in errors[0]
+    assert "cannot see" in errors[0]
+    assert "WHITE CELL" in caplog.text
+    assert "cannot see" in caplog.text
+
+
+async def test_ready_reports_missing_posting_permissions(tmp_path):
+    """Seeing the channel is not enough: without Embed Links every ruling's
+    audit embed would fail, one logger.exception at a time."""
+    errors = []
+    bot = make_bot(tmp_path, errors)
+    bot.get_channel = lambda channel_id: _text_channel(embed_links=False)
+
+    await bot.on_ready()
+
+    assert errors and "Embed Links" in errors[0]
+
+
+async def test_ready_warns_about_an_allowed_channel_the_bot_cannot_read(tmp_path):
+    errors = []
+    bot = make_bot(tmp_path, errors, ALLOWED_CHANNEL_IDS="777")
+    channels = {12345: _text_channel(), 777: _text_channel("blue-1", view_channel=False)}
+    bot.get_channel = lambda channel_id: channels.get(channel_id)
+
+    await bot.on_ready()
+
+    assert len(errors) == 1
+    assert "777" in errors[0]
+    assert "ignored" in errors[0]
+
+
+async def test_ready_confirms_a_working_white_cell_once_across_reconnects(tmp_path, caplog):
+    """Silence on success left operators unsure oversight was wired up at all;
+    READY fires again on every resume and must not re-check."""
+    errors = []
+    bot = make_bot(tmp_path, errors)
+    bot.get_channel = lambda channel_id: None
+    bot.fetch_channel = AsyncMock(return_value=_text_channel())
+
+    with caplog.at_level(logging.INFO):
+        await bot.on_ready()
+        await bot.on_ready()
+
+    assert errors == []
+    assert "WHITE CELL" not in caplog.text
+    assert "white-cell" in caplog.text
+    assert "verified" in caplog.text.lower()
+    bot.fetch_channel.assert_awaited_once_with(12345)
+
+
+async def test_setup_hook_does_not_block_startup_on_sync_failure(tmp_path):
+    bot = make_bot(tmp_path)
+    bot.tree.sync = AsyncMock(side_effect=RuntimeError("discord unreachable"))
+
+    await bot.setup_hook()  # must not raise

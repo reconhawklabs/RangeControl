@@ -15,6 +15,9 @@ if TYPE_CHECKING:  # pragma: no cover - import only for the return annotation
 
 FIELD_LIMIT = 1024
 NAME_LIMIT = 256
+EMBED_LIMIT = 6000  # Discord's cap on an embed's title plus every field
+SCREEN_LIMIT = 256
+DRAFT_LIMIT = 512
 
 _COLOURS = {
     "APPROVED": 0x2ECC71,
@@ -82,6 +85,23 @@ def embed_fields(
         )
     else:
         fields.append(("Outcome", advice.kind, True))
+
+    # A withheld draft is shown, never silently dropped: a screen that trips
+    # often is the white cell's first sign the ruling prompt is drifting.
+    # Clipped tighter than FIELD_LIMIT: with both added, a worst-case ruling
+    # embed would pass Discord's 6000-character total, the post would fail,
+    # and with human in the loop on that answers the asker unreviewed.
+    if advice.screen_reason and ruling is not None:
+        fields.extend(
+            [
+                ("Screened", _clip(advice.screen_reason, SCREEN_LIMIT), False),
+                (
+                    "Withheld draft (not sent)",
+                    _clip(ruling.public_response, DRAFT_LIMIT),
+                    False,
+                ),
+            ]
+        )
 
     fields.append(("Sent to blue team", _clip(advice.public_text), False))
 

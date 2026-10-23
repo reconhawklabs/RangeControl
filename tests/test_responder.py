@@ -1,9 +1,11 @@
 from rangecontrol.advisor.models import Advice, GateResult, GateVerdict, Ruling
 from rangecontrol.bot.responder import DISCORD_LIMIT, format_public
-from rangecontrol.bot.whitecell import build_embed, embed_fields
+from rangecontrol.bot.whitecell import EMBED_LIMIT, build_embed, embed_fields
+
+PUBLIC = "No. That is waiting on the change board."
 
 
-def ruling(verdict="DENIED", confidence="high", public="No. A partner service uses it."):
+def ruling(verdict="DENIED", confidence="high", public=PUBLIC):
     return Ruling(
         verdict=verdict,
         public_response=public,
@@ -16,7 +18,7 @@ def ruling(verdict="DENIED", confidence="high", public="No. A partner service us
 def advice(**overrides):
     payload = {
         "kind": "ruling",
-        "public_text": "No. A partner service uses it.",
+        "public_text": PUBLIC,
         "ruling": ruling(),
         "gate": GateResult(verdict=GateVerdict.CHANGE_REQUEST, reason="r"),
     }
@@ -24,145 +26,114 @@ def advice(**overrides):
     return Advice(**payload)
 
 
-def test_denial_is_sent_verbatim_with_no_added_framing():
-    assert format_public(advice()) == "No. A partner service uses it."
+def fields_of(item, **kwargs):
+    kwargs = {"user_name": "u", "channel_name": "c", "question": "q", **kwargs}
+    return embed_fields(item, **kwargs)
 
 
-def test_approval_is_sent_verbatim():
-    approved = advice(
-        kind="ruling",
-        public_text="Approved. Watch your own management path.",
-        ruling=ruling(verdict="APPROVED", public="Approved. Watch your own management path."),
-    )
-    assert format_public(approved) == "Approved. Watch your own management path."
+def test_public_reply_is_the_text_verbatim_with_nothing_internal():
+    """No framing, label, or confidence badge: anything added here could
+    correlate denials, and nothing internal may ride along."""
+    approved = "Approved. Watch your own management path."
+    cases = [
+        advice(ruling=ruling(confidence="low")),
+        advice(public_text=approved, ruling=ruling(verdict="APPROVED", public=approved)),
+        advice(kind="deflection", public_text="D", ruling=None),
+        advice(kind="error", public_text="E", ruling=None),
+    ]
+    for case in cases:
+        rendered = format_public(case)
+        assert rendered == case.public_text
+        for internal in ("MSEL-01", "DC-VULCAN", "confidence"):
+            assert internal.lower() not in rendered.lower()
 
 
-def test_deflection_and_error_text_pass_through():
-    assert format_public(advice(kind="deflection", public_text="D", ruling=None)) == "D"
-    assert format_public(advice(kind="error", public_text="E", ruling=None)) == "E"
-
-
-def test_output_never_exceeds_the_discord_limit():
+def test_public_reply_never_exceeds_the_discord_limit():
     long = advice(public_text="x" * (DISCORD_LIMIT + 500), ruling=ruling(public="x" * 3000))
     assert len(format_public(long)) <= DISCORD_LIMIT
 
 
-def test_public_output_never_contains_internal_reason_or_impacted():
-    rendered = format_public(advice())
-    assert "MSEL-01" not in rendered
-    assert "DC-VULCAN" not in rendered
-
-
-def test_public_output_never_labels_the_confidence():
-    assert "confidence" not in format_public(advice(ruling=ruling(confidence="low"))).lower()
-
-
-def test_white_cell_fields_carry_the_real_reason():
-    fields = dict((name, value) for name, value, _ in embed_fields(
-        advice(), user_name="blue-lead", channel_name="ops", question="block it"
-    ))
+def test_white_cell_embed_carries_what_the_public_reply_withholds():
+    fields = {
+        name: value
+        for name, value, _ in fields_of(
+            advice(ruling=ruling(confidence="low")),
+            user_name="blue-lead", channel_name="ops", question="block it",
+        )
+    }
     joined = " ".join(fields.values())
-    assert "DC-VULCAN" in joined
-    assert "MSEL-01" in joined
-    assert "blue-lead" in joined
-    assert "block it" in joined
+    for expected in ("DC-VULCAN", "MSEL-01", "blue-lead", "block it"):
+        assert expected in joined
+    assert fields["Sent to blue team"] == PUBLIC
+    assert "LOW" in fields["Confidence"].upper()
+
+    error = Advice(kind="error", public_text="can't process", error="LLMError('down')")
+    assert any("LLMError" in value for _, value, _ in fields_of(error))
 
 
-def test_white_cell_includes_the_exact_public_text_that_was_sent():
-    fields = embed_fields(
-        advice(), user_name="u", channel_name="c", question="q"
+def test_the_embed_states_whether_a_reviewer_must_act():
+    """With HITL on, an embed with no prompt reads as the mode being broken
+    unless it says why nothing is held; with HITL off that note is noise."""
+    held = build_embed(advice(), user_name="u", channel_name="c", question="q",
+                       awaiting=True, hitl_enabled=True)
+    held_names = [field.name for field in held.fields]
+    assert held.title.startswith("⏳ AWAITING REVIEW")
+    assert "Awaiting review" in held_names
+    assert "Not held" not in held_names
+
+    clarify = Advice(kind="clarify", public_text="Which address, and where?")
+    not_held = fields_of(clarify, hitl_enabled=True)
+    text = " ".join(f"{name} {value}" for name, value, _ in not_held).lower()
+    assert "not held" in text
+    assert "clarify" in text
+    assert "Awaiting review" not in [name for name, _, _ in not_held]
+
+    off = build_embed(clarify, user_name="u", channel_name="c", question="q")
+    assert not off.title.startswith("⏳")
+    assert {"Awaiting review", "Not held"}.isdisjoint(f.name for f in off.fields)
+
+
+def test_white_cell_sees_the_withheld_draft_and_why():
+    """The reviewer has to be able to tell the prompt is drifting, so the
+    replacement is never silent."""
+    draft = "Approved. Nothing in our inventory matches that address."
+    screened = advice(
+        public_text="Approved — go ahead.",
+        ruling=ruling(verdict="APPROVED", public=draft),
+        screen_reason="claims about what exists: inventory",
     )
-    assert any("No. A partner service uses it." in value for _, value, _ in fields)
+    fields = {name: value for name, value, _ in fields_of(screened)}
+    assert fields["Sent to blue team"] == "Approved — go ahead."
+    assert draft in " ".join(fields.values())
+    assert "inventory" in fields["Screened"]
+
+    assert "Screened" not in [name for name, _, _ in fields_of(advice())]
 
 
-def test_low_confidence_is_flagged_for_the_white_cell():
-    fields = embed_fields(
-        advice(ruling=ruling(confidence="low")),
-        user_name="u", channel_name="c", question="q",
+def test_a_worst_case_screened_ruling_embed_fits_discord():
+    """Discord rejects an embed over 6000 characters in total. The white cell
+    post would fail, and with human in the loop on the asker is then answered
+    with no review at all, so every field and the total must fit."""
+    long = "x" * 5000
+    worst = Advice(
+        kind="ruling",
+        public_text=long,
+        ruling=Ruling(
+            verdict="APPROVED",
+            public_response=long,
+            internal_reason=long,
+            impacted=(long,),
+            confidence="low",
+        ),
+        gate=GateResult(verdict=GateVerdict.CHANGE_REQUEST, reason="r"),
+        screen_reason=long,
     )
-    joined = " ".join(value for _, value, _ in fields)
-    assert "⚠" in joined or "LOW" in joined.upper()
-
-
-def test_error_advice_produces_an_embed_with_the_error_detail():
-    fields = embed_fields(
-        Advice(kind="error", public_text="can't process", error="LLMError('down')"),
-        user_name="u", channel_name="c", question="q",
-    )
-    assert any("LLMError" in value for _, value, _ in fields)
-
-
-def test_every_embed_field_fits_discord_limits():
-    long_advice = advice(ruling=ruling(public="p" * 3000))
-    for name, value, _ in embed_fields(
-        long_advice, user_name="u", channel_name="c", question="q" * 3000
-    ):
-        assert len(name) <= 256
-        assert len(value) <= 1024
-
-
-def test_awaiting_review_appends_a_field_instructing_the_white_cell_to_react():
-    fields = embed_fields(
-        advice(), user_name="u", channel_name="c", question="q", awaiting=True
-    )
-    assert "Awaiting review" in [name for name, _, _ in fields]
-
-
-def test_awaiting_review_prefixes_the_embed_title():
     embed = build_embed(
-        advice(), user_name="u", channel_name="c", question="q", awaiting=True
+        worst, user_name=long, channel_name=long, question=long,
+        awaiting=True, hitl_enabled=True,
     )
-    assert embed.title.startswith("⏳ AWAITING REVIEW")
-
-
-def test_without_awaiting_the_embed_has_no_review_prompt():
-    fields = embed_fields(advice(), user_name="u", channel_name="c", question="q")
-    assert "Awaiting review" not in [name for name, _, _ in fields]
-
-    embed = build_embed(advice(), user_name="u", channel_name="c", question="q")
-    assert not embed.title.startswith("⏳")
-
-
-# --- explaining why something was not held ---------------------------------
-
-
-def test_a_non_ruling_says_why_it_was_not_held_when_hitl_is_on():
-    """The operator ticked "hold every ruling" and is watching this embed.
-
-    Nothing here distinguished "held for you" from "answered already" except
-    the absence of a prompt, which reads as the feature being broken.
-    """
-    from rangecontrol.advisor.models import Advice
-    from rangecontrol.bot.whitecell import embed_fields
-
-    advice = Advice(kind="clarify", public_text="Which address, and where?")
-    fields = embed_fields(advice, user_name="blue", channel_name="ops-blue",
-                          question="q", awaiting=False, hitl_enabled=True)
-    text = " ".join(f"{n} {v}" for n, v, _ in fields)
-    assert "not held" in text.lower()
-    assert "clarify" in text.lower()
-
-
-def test_a_held_ruling_does_not_carry_the_not_held_note():
-    from rangecontrol.advisor.models import Advice, Ruling
-    from rangecontrol.bot.whitecell import embed_fields
-
-    ruling = Ruling(verdict="DENIED", public_response="No.", internal_reason="r",
-                    impacted=(), confidence="high")
-    fields = embed_fields(Advice(kind="ruling", public_text="No.", ruling=ruling),
-                          user_name="blue", channel_name="ops-blue", question="q",
-                          awaiting=True, hitl_enabled=True)
-    text = " ".join(f"{n} {v}" for n, v, _ in fields)
-    assert "not held" not in text.lower()
-
-
-def test_nothing_is_explained_when_hitl_is_off():
-    """With the mode off, "not held" would be noise on every single question."""
-    from rangecontrol.advisor.models import Advice
-    from rangecontrol.bot.whitecell import embed_fields
-
-    fields = embed_fields(Advice(kind="clarify", public_text="?"),
-                          user_name="blue", channel_name="ops-blue", question="q",
-                          awaiting=False, hitl_enabled=False)
-    text = " ".join(f"{n} {v}" for n, v, _ in fields)
-    assert "not held" not in text.lower()
+    for field in embed.fields:
+        assert len(field.name) <= 256
+        assert len(field.value) <= 1024
+    total = len(embed.title) + sum(len(f.name) + len(f.value) for f in embed.fields)
+    assert total <= EMBED_LIMIT
