@@ -4,19 +4,6 @@ import time
 from rangecontrol.bot.mode import ModeSwitch
 
 
-def test_defaults_to_the_value_it_was_constructed_with():
-    assert ModeSwitch(True).enabled is True
-    assert ModeSwitch(False).enabled is False
-
-
-def test_set_changes_the_value():
-    switch = ModeSwitch(False)
-    switch.set(True)
-    assert switch.enabled is True
-    switch.set(False)
-    assert switch.enabled is False
-
-
 def test_a_change_on_one_thread_is_visible_on_another():
     """The GUI toggles from the Tk thread; the bot reads from its own."""
     switch = ModeSwitch(False)

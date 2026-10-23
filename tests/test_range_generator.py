@@ -17,27 +17,14 @@ def corpus():
     return Corpus(docs=(ExtractedDoc(path="notes.txt", kind="text", text="segment A"),))
 
 
-def test_returns_generated_document():
+def test_generation_sends_corpus_and_template_with_a_generous_budget():
     provider = StubProvider(completions=[COMPLETE])
-    assert "Protected Dependency Index" in generate_range_md(corpus(), provider)
-
-
-def test_corpus_text_is_sent_to_the_model():
-    provider = StubProvider(completions=[COMPLETE])
-    generate_range_md(corpus(), provider)
-    assert "segment A" in provider.calls[0]["user"]
-
-
-def test_template_is_sent_to_the_model():
-    provider = StubProvider(completions=[COMPLETE])
-    generate_range_md(corpus(), provider, template="## Custom Template")
-    assert "## Custom Template" in provider.calls[0]["user"]
-
-
-def test_generation_uses_a_generous_token_budget():
-    provider = StubProvider(completions=[COMPLETE])
-    generate_range_md(corpus(), provider)
-    assert provider.calls[0]["max_tokens"] >= 16000
+    result = generate_range_md(corpus(), provider, template="## Custom Template")
+    assert "Protected Dependency Index" in result
+    call = provider.calls[0]
+    assert "segment A" in call["user"]
+    assert "## Custom Template" in call["user"]
+    assert call["max_tokens"] >= 16000
 
 
 def test_prompt_forbids_inventing_facts():
@@ -61,43 +48,26 @@ def test_prompt_forbids_inventing_facts():
     assert "contradict" in lowered
 
 
-def test_incomplete_output_raises_and_names_the_missing_sections():
-    provider = StubProvider(completions=["## Exercise Overview\n\nonly this"])
+def test_generation_fails_loudly_rather_than_returning_a_partial_document():
+    incomplete = StubProvider(completions=["## Exercise Overview\n\nonly this"])
     with pytest.raises(ValueError) as exc:
-        generate_range_md(corpus(), provider)
+        generate_range_md(corpus(), incomplete)
     assert "Ingest Gaps" in str(exc.value)
 
-
-def test_provider_failure_propagates():
-    provider = StubProvider(error=LLMError("no route to host"))
     with pytest.raises(LLMError):
-        generate_range_md(corpus(), provider)
+        generate_range_md(corpus(), StubProvider(error=LLMError("no route to host")))
 
-
-def test_empty_corpus_raises_before_calling_the_model():
-    provider = StubProvider(completions=[COMPLETE])
+    unused = StubProvider(completions=[COMPLETE])
     with pytest.raises(ValueError):
-        generate_range_md(Corpus(docs=()), provider)
-    assert provider.calls == []
+        generate_range_md(Corpus(docs=()), unused)
+    assert unused.calls == []
 
 
-def test_write_creates_the_file_and_returns_its_path(tmp_path):
-    path = write_range_md(tmp_path, "# Range\n")
-    assert path == tmp_path / "Range.md"
-    assert path.read_text(encoding="utf-8") == "# Range\n"
-
-
-def test_write_backs_up_an_existing_file(tmp_path):
-    (tmp_path / "Range.md").write_text("old", encoding="utf-8")
-    write_range_md(tmp_path, "new")
-    assert (tmp_path / "Range.md.bak").read_text(encoding="utf-8") == "old"
-    assert (tmp_path / "Range.md").read_text(encoding="utf-8") == "new"
-
-
-def test_repeated_writes_never_overwrite_an_earlier_backup(tmp_path):
+def test_writes_never_lose_an_earlier_range_md(tmp_path):
     (tmp_path / "Range.md").write_text("operator hand-edited", encoding="utf-8")
-    write_range_md(tmp_path, "generated one")
+    path = write_range_md(tmp_path, "generated one")
     write_range_md(tmp_path, "generated two")
+    assert path == tmp_path / "Range.md"
     assert (tmp_path / "Range.md.bak").read_text(encoding="utf-8") == "operator hand-edited"
     assert (tmp_path / "Range.md.bak.1").read_text(encoding="utf-8") == "generated one"
-    assert (tmp_path / "Range.md").read_text(encoding="utf-8") == "generated two"
+    assert path.read_text(encoding="utf-8") == "generated two"

@@ -47,65 +47,48 @@ def _bot(channel=None, fetch_error=None):
     return bot
 
 
-async def test_reachable_channel_with_all_permissions_is_ok():
-    result = await check_channel(_bot(_channel()), 42, WHITE_CELL_PERMISSIONS)
+async def test_a_usable_channel_missing_from_the_cache_is_fetched_and_passes():
+    bot = _bot(None)
+    bot.fetch_channel = AsyncMock(return_value=_channel())
+
+    result = await check_channel(bot, 42, WHITE_CELL_PERMISSIONS)
+
     assert result.ok
     assert result.name == "white-cell"
     assert result.problem == ""
-
-
-async def test_wrong_id_names_the_id_as_the_problem():
-    bot = _bot(fetch_error=_http_error(discord.NotFound, 404, "Not Found"))
-    result = await check_channel(bot, 42, WHITE_CELL_PERMISSIONS)
-    assert not result.ok
-    assert "channel ID" in result.problem
-    assert "invited" in result.problem
-
-
-async def test_private_channel_the_bot_cannot_see_says_so():
-    bot = _bot(fetch_error=_http_error(discord.Forbidden, 403, "Forbidden"))
-    result = await check_channel(bot, 42, WHITE_CELL_PERMISSIONS)
-    assert not result.ok
-    assert "cannot see" in result.problem
-    assert "role" in result.problem
-
-
-async def test_missing_permissions_are_listed_by_name():
-    channel = _channel(perms=_perms(embed_links=False, add_reactions=False))
-    result = await check_channel(_bot(channel), 42, WHITE_CELL_PERMISSIONS)
-    assert not result.ok
-    assert "Embed Links" in result.problem
-    assert "Add Reactions" in result.problem
-    assert "Send Messages" not in result.problem
-
-
-async def test_allowed_channels_need_fewer_permissions():
-    channel = _channel(perms=_perms(embed_links=False, add_reactions=False))
-    result = await check_channel(_bot(channel), 42, ALLOWED_CHANNEL_PERMISSIONS)
-    assert result.ok
-
-
-async def test_a_direct_message_channel_is_rejected():
-    result = await check_channel(_bot(_channel(guild=False)), 42, WHITE_CELL_PERMISSIONS)
-    assert not result.ok
-    assert "server" in result.problem
-
-
-async def test_unexpected_failure_reports_the_exception():
-    bot = _bot(fetch_error=RuntimeError("socket closed"))
-    result = await check_channel(bot, 42, WHITE_CELL_PERMISSIONS)
-    assert not result.ok
-    assert "RuntimeError" in result.problem
-    assert "socket closed" in result.problem
-
-
-async def test_cache_miss_falls_back_to_the_api():
-    channel = _channel()
-    bot = _bot(None)
-    bot.fetch_channel = AsyncMock(return_value=channel)
-    result = await check_channel(bot, 42, WHITE_CELL_PERMISSIONS)
-    assert result.ok
     bot.fetch_channel.assert_awaited_once_with(42)
+
+
+async def test_each_unreachable_cause_is_named():
+    cases = [
+        ("wrong ID", _bot(fetch_error=_http_error(discord.NotFound, 404, "Not Found")),
+         ("channel ID", "invited")),
+        ("private channel", _bot(fetch_error=_http_error(discord.Forbidden, 403, "Forbidden")),
+         ("cannot see", "role")),
+        ("direct message", _bot(_channel(guild=False)), ("server",)),
+        ("unexpected failure", _bot(fetch_error=RuntimeError("socket closed")),
+         ("RuntimeError", "socket closed")),
+    ]
+    for label, bot, expected in cases:
+        result = await check_channel(bot, 42, WHITE_CELL_PERMISSIONS)
+        assert not result.ok, label
+        for phrase in expected:
+            assert phrase in result.problem, (label, phrase)
+
+
+async def test_missing_permissions_are_named_against_what_the_channel_needs():
+    """The white cell needs Embed Links and Add Reactions; an allowed channel,
+    which only reads mentions and replies, does not."""
+    channel = _channel(perms=_perms(embed_links=False, add_reactions=False))
+
+    white = await check_channel(_bot(channel), 42, WHITE_CELL_PERMISSIONS)
+    assert not white.ok
+    assert "Embed Links" in white.problem
+    assert "Add Reactions" in white.problem
+    assert "Send Messages" not in white.problem
+
+    allowed = await check_channel(_bot(channel), 42, ALLOWED_CHANNEL_PERMISSIONS)
+    assert allowed.ok
 
 
 async def test_permissions_cannot_be_checked_without_a_member_object():
