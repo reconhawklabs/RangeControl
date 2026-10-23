@@ -29,7 +29,11 @@ _VALID = {
 # not this constant.
 GATE_MAX_TOKENS = 4000
 
-_FENCE = re.compile(r"^```[a-zA-Z0-9_-]*\s*|\s*```$")
+# The closing branch is a bare "```$", not "\s*```$": the input is stripped
+# first and the result stripped again, so the whitespace needs no matching,
+# and a leading \s* there is retried from every position of a whitespace run,
+# which is quadratic on a model stuck emitting blank space.
+_FENCE = re.compile(r"^```[a-zA-Z0-9_-]*\s*|```$")
 
 
 def parse_json_object(raw: str) -> dict:

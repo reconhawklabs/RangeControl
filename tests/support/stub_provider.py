@@ -8,7 +8,7 @@ class StubProvider:
 
     def __init__(
         self,
-        completions: list[str] | None = None,
+        completions: list[str | Exception] | None = None,
         image_text: str = "stub image description",
         error: Exception | None = None,
     ) -> None:
@@ -39,7 +39,12 @@ class StubProvider:
         if self._error is not None:
             raise self._error
         assert self._completions, "StubProvider ran out of queued completions"
-        return self._completions.pop(0)
+        completion = self._completions.pop(0)
+        # A queued exception fails that one call only, so a test can let the
+        # ruling succeed and the reply review after it fail.
+        if isinstance(completion, Exception):
+            raise completion
+        return completion
 
     def describe_image(
         self,

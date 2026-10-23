@@ -71,6 +71,12 @@ class AuditLog:
         }
         if reviewer:
             record["reviewer"] = reviewer
+        if advice.screen_reason and ruling is not None:
+            # ``public_response`` above is the fallback that was sent; the
+            # model's own reply is kept here so a review can see what the
+            # screen stopped. Omitted when nothing was screened, like ``held``.
+            record["screen_reason"] = advice.screen_reason
+            record["model_draft"] = ruling.public_response
         if held:
             # A ruling held for white cell approval has ``public_response``
             # set to the text that is *awaiting* release, not what the blue

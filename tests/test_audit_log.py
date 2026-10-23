@@ -1,8 +1,11 @@
 import json
+from dataclasses import replace
 from datetime import datetime, timezone
 
 from rangecontrol.advisor.models import Advice, GateResult, GateVerdict, Ruling
 from rangecontrol.audit.log import AuditLog
+
+DRAFT = "No. That is waiting on the change board."
 
 
 def clock():
@@ -12,10 +15,10 @@ def clock():
 def ruling_advice():
     return Advice(
         kind="ruling",
-        public_text="No. That range belongs to a partner service.",
+        public_text=DRAFT,
         ruling=Ruling(
             verdict="DENIED",
-            public_response="No. That range belongs to a partner service.",
+            public_response=DRAFT,
             internal_reason="would break MSEL-01",
             impacted=("MSEL-01",),
             confidence="high",
@@ -24,64 +27,85 @@ def ruling_advice():
     )
 
 
-def write(tmp_path, advice):
+def record(log, advice, **kwargs):
+    fields = {
+        "user_id": 42,
+        "user_name": "blue-lead",
+        "channel_id": 7,
+        "question": "can we block 77.232.11.2",
+        "latency_ms": 1234,
+        **kwargs,
+    }
+    log.record(advice, **fields)
+
+
+def lines_of(log):
+    text = log.path_for_today().read_text(encoding="utf-8")
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+def test_each_ruling_is_one_dated_json_line_with_every_field(tmp_path):
+    """Written to a directory created on demand; held/screen fields are
+    omitted when they do not apply, so nothing reads as held or screened."""
+    log = AuditLog(tmp_path / "nested" / "audit", clock=clock)
+    record(log, ruling_advice())
+    record(log, ruling_advice())
+
+    assert log.path_for_today() == tmp_path / "nested" / "audit" / "audit-20260728.jsonl"
+    first, second = lines_of(log)
+    assert first == second
+    assert first["timestamp"] == "2026-07-28T14:30:00+00:00"
+    assert first["user_id"] == 42
+    assert first["user_name"] == "blue-lead"
+    assert first["channel_id"] == 7
+    assert first["question"] == "can we block 77.232.11.2"
+    assert first["kind"] == "ruling"
+    assert first["verdict"] == "DENIED"
+    assert first["public_response"] == DRAFT
+    assert first["internal_reason"] == "would break MSEL-01"
+    assert first["impacted"] == ["MSEL-01"]
+    assert first["confidence"] == "high"
+    assert first["gate_verdict"] == GateVerdict.CHANGE_REQUEST
+    assert first["latency_ms"] == 1234
+    for absent in ("held", "screen_reason", "model_draft"):
+        assert absent not in first
+
+
+def test_deflections_and_errors_are_recorded(tmp_path):
     log = AuditLog(tmp_path, clock=clock)
-    return log, log.record(
-        advice,
-        user_id=42,
-        user_name="blue-lead",
-        channel_id=7,
-        question="can we block 77.232.11.2",
-        latency_ms=1234,
-    )
-
-
-def test_writes_one_json_line_per_record(tmp_path):
-    log, _ = write(tmp_path, ruling_advice())
-    write(tmp_path, ruling_advice())
-    lines = log.path_for_today().read_text(encoding="utf-8").strip().split("\n")
-    assert len(lines) == 2
-    assert all(json.loads(line) for line in lines)
-
-
-def test_filename_is_dated(tmp_path):
-    log, _ = write(tmp_path, ruling_advice())
-    assert log.path_for_today().name == "audit-20260728.jsonl"
-
-
-def test_record_captures_every_field(tmp_path):
-    _, record = write(tmp_path, ruling_advice())
-    assert record["timestamp"] == "2026-07-28T14:30:00+00:00"
-    assert record["user_id"] == 42
-    assert record["user_name"] == "blue-lead"
-    assert record["channel_id"] == 7
-    assert record["question"] == "can we block 77.232.11.2"
-    assert record["kind"] == "ruling"
-    assert record["verdict"] == "DENIED"
-    assert record["internal_reason"] == "would break MSEL-01"
-    assert record["impacted"] == ["MSEL-01"]
-    assert record["confidence"] == "high"
-    assert record["gate_verdict"] == GateVerdict.CHANGE_REQUEST
-    assert record["latency_ms"] == 1234
-
-
-def test_deflections_are_recorded_with_null_ruling_fields(tmp_path):
-    advice = Advice(
+    deflection = Advice(
         kind="deflection",
         public_text="I only handle change requests.",
         gate=GateResult(verdict=GateVerdict.NOT_A_CHANGE_REQUEST, reason="recon"),
     )
-    _, record = write(tmp_path, advice)
-    assert record["kind"] == "deflection"
-    assert record["verdict"] is None
-    assert record["impacted"] == []
+    record(log, deflection, user_name="ü", question="Ω")
+    record(log, Advice(kind="error", public_text="can't process", error="LLMError('x')"))
+
+    deflected, errored = lines_of(log)
+    assert deflected["kind"] == "deflection"
+    assert deflected["verdict"] is None
+    assert deflected["impacted"] == []
+    assert (deflected["user_name"], deflected["question"]) == ("ü", "Ω")
+    assert errored["kind"] == "error"
+    assert errored["error"] == "LLMError('x')"
 
 
-def test_errors_are_recorded(tmp_path):
-    advice = Advice(kind="error", public_text="can't process", error="LLMError('x')")
-    _, record = write(tmp_path, advice)
-    assert record["kind"] == "error"
-    assert record["error"] == "LLMError('x')"
+def test_a_held_screened_ruling_records_what_was_withheld(tmp_path):
+    """The after-action review must tell the delivered text from the model's
+    withheld draft, and a held ruling from one that went out."""
+    screened = replace(
+        ruling_advice(),
+        public_text="Not approved. It needs a sign-off that hasn't been given.",
+        screen_reason="describes ownership",
+    )
+    log = AuditLog(tmp_path, clock=clock)
+    record(log, screened, held=True)
+
+    [line] = lines_of(log)
+    assert line["held"] is True
+    assert line["public_response"] == screened.public_text
+    assert line["model_draft"] == DRAFT
+    assert line["screen_reason"] == "describes ownership"
 
 
 def test_record_and_filename_dates_cannot_disagree(tmp_path):
@@ -93,7 +117,7 @@ def test_record_and_filename_dates_cannot_disagree(tmp_path):
         ]
     )
     log = AuditLog(tmp_path, clock=lambda: next(times))
-    record = log.record(
+    written_record = log.record(
         Advice(kind="error", public_text="x"),
         user_id=1,
         user_name="u",
@@ -103,62 +127,12 @@ def test_record_and_filename_dates_cannot_disagree(tmp_path):
     )
     written = [p for p in tmp_path.iterdir() if p.suffix == ".jsonl"]
     assert len(written) == 1
-    assert record["timestamp"].startswith("2026-07-28")
+    assert written_record["timestamp"].startswith("2026-07-28")
     assert written[0].name == "audit-20260728.jsonl"
 
 
-def test_records_the_public_response(tmp_path):
-    _, record = write(tmp_path, ruling_advice())
-    assert record["public_response"] == "No. That range belongs to a partner service."
-
-
-def test_held_is_omitted_by_default(tmp_path):
-    """A ruling answered immediately must not read as held in an
-    after-action review."""
-    _, record = write(tmp_path, ruling_advice())
-    assert "held" not in record
-
-
-def test_held_true_is_recorded_when_a_ruling_is_held(tmp_path):
-    log = AuditLog(tmp_path, clock=clock)
-    record = log.record(
-        ruling_advice(), user_id=1, user_name="u", channel_id=1,
-        question="q", latency_ms=0, held=True,
-    )
-    assert record["held"] is True
-
-
-def test_creates_the_directory(tmp_path):
-    target = tmp_path / "nested" / "audit"
-    AuditLog(target, clock=clock).record(
-        ruling_advice(),
-        user_id=1,
-        user_name="u",
-        channel_id=1,
-        question="q",
-        latency_ms=0,
-    )
-    assert target.is_dir()
-
-
-def test_unicode_survives_the_round_trip(tmp_path):
-    advice = Advice(kind="deflection", public_text="—")
-    log = AuditLog(tmp_path, clock=clock)
-    log.record(advice, user_id=1, user_name="ü", channel_id=1, question="Ω", latency_ms=0)
-    line = log.path_for_today().read_text(encoding="utf-8").strip()
-    assert json.loads(line)["question"] == "Ω"
-
-
 def test_write_failure_does_not_raise(tmp_path):
+    """A broken audit path can never take the bot down."""
     blocker = tmp_path / "audit"
     blocker.write_text("I am a file, not a directory", encoding="utf-8")
-    log = AuditLog(blocker, clock=clock)
-    # Must not raise — a broken audit path can never take the bot down.
-    log.record(
-        ruling_advice(),
-        user_id=1,
-        user_name="u",
-        channel_id=1,
-        question="q",
-        latency_ms=0,
-    )
+    record(AuditLog(blocker, clock=clock), ruling_advice())

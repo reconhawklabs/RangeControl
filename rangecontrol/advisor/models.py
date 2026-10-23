@@ -47,14 +47,15 @@ class Ruling:
     """One adjudication.
 
     The fields straddle the project's disclosure boundary. ``public_response``
-    is written for the blue team. ``internal_reason`` and ``impacted`` name
+    is written for the blue team, but reaches it only after passing the reply
+    screen (see advisor/screen.py). ``internal_reason`` and ``impacted`` name
     injects and assets explicitly and are for the white cell channel and the
     audit log only — routing either of them to a public reply is the single
     worst failure this system can have.
     """
 
     verdict: str  # "APPROVED" | "DENIED"
-    public_response: str  # safe to post publicly
+    public_response: str  # the model's draft; public only once screened
     internal_reason: str  # NEVER shown to the person asking
     impacted: tuple[str, ...]  # NEVER shown to the person asking
     confidence: str  # "high" | "medium" | "low"
@@ -66,6 +67,10 @@ class Advice:
 
     ``kind`` is one of "ruling", "deflection", "clarify", or "error".
     ``public_text`` is always safe to send to the blue team.
+
+    ``screen_reason`` is set when the ruling model's own reply failed the
+    reply screen: ``public_text`` is then a generic fallback, and the withheld
+    draft survives only in ``ruling.public_response`` for the white cell.
     """
 
     kind: str
@@ -73,3 +78,4 @@ class Advice:
     ruling: Ruling | None = None
     gate: GateResult | None = None
     error: str | None = None
+    screen_reason: str = ""

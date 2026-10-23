@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Run the leak suite against a live provider.
 
-Offline CI proves the plumbing never leaks. This proves the *prompt* holds.
-Run it before an exercise, and after any edit to advisor/prompts.py.
+Offline CI proves the plumbing never leaks. This proves the *prompts* hold:
+the ruling prompt writes replies that need no screening, and the reply
+reviewer catches the disclosures no regex can see. Run it before an exercise,
+and after any edit to advisor/prompts.py.
 
 Usage:
     LLM_PROVIDER=anthropic LLM_API_KEY=... \\
@@ -20,6 +22,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from rangecontrol.advisor.engine import Advisor  # noqa: E402
 from rangecontrol.config import load_config  # noqa: E402
 from rangecontrol.llm.factory import build_gate_provider, build_provider  # noqa: E402
+from rangecontrol.advisor.screen import review_reply  # noqa: E402
+from tests.support.screen_corpus import BENIGN, SEMANTIC_LEAKS  # noqa: E402
 from tests.test_leak_suite import (  # noqa: E402
     ADVERSARIAL_QUESTIONS,
     FIXTURE,
@@ -42,7 +46,17 @@ HOSTILE_GUIDANCE = (
 
 
 def _run(advisor, label: str) -> int:
+    """Return the number of leaks that reached the asker plus the number of
+    drafts the screen had to withhold.
+
+    A withheld draft never reached the asker, but it still counts: it means
+    the ruling prompt did not hold, and the screen was the only thing left.
+    Every reply is printed in full, because the indicator check cannot see an
+    existence claim ("nothing on our books matches that") and a person reading
+    the output can.
+    """
     failures = 0
+    screened = 0
     for question in ADVERSARIAL_QUESTIONS:
         advice = advisor.advise(question)
         try:
@@ -50,10 +64,43 @@ def _run(advisor, label: str) -> int:
         except AssertionError as exc:
             failures += 1
             print(f"FAIL [{label}] {question}\n  {exc}\n")
-        else:
-            print(f"ok   [{label}] [{advice.kind:<10}] {question}")
+            continue
+        print(f"ok   [{label}] [{advice.kind:<10}] {question}")
+        print(f"       -> {advice.public_text}")
+        if advice.screen_reason:
+            screened += 1
+            print(f"       SCREENED: {advice.screen_reason}")
+            print(f"       withheld draft: {advice.ruling.public_response}")
     total = len(ADVERSARIAL_QUESTIONS)
-    print(f"{label}: {total - failures}/{total} passed\n")
+    print(
+        f"{label}: {failures} leaked to the asker, "
+        f"{screened} drafts withheld by the screen, of {total}\n"
+    )
+    return failures + screened
+
+
+def _review(provider) -> int:
+    """Run the reviewer on disclosures only it can catch, and on benign ones.
+
+    A missed disclosure is a failure. A benign reply flagged is printed but
+    not failed: it costs a generic reply, not a leak.
+    """
+    failures = 0
+    for question, reply in SEMANTIC_LEAKS:
+        reason = review_reply(reply, question, provider)
+        status = "ok  " if reason else "MISS"
+        failures += 0 if reason else 1
+        print(f"{status} [review leak] {reply}")
+    flagged = 0
+    for question, reply in BENIGN:
+        reason = review_reply(reply, question, provider)
+        if reason:
+            flagged += 1
+            print(f"FP   [review benign] {reply}\n       -> {reason}")
+    print(
+        f"reviewer: missed {failures}/{len(SEMANTIC_LEAKS)} disclosures, "
+        f"flagged {flagged}/{len(BENIGN)} benign replies\n"
+    )
     return failures
 
 
@@ -73,6 +120,7 @@ def main() -> int:
 
     failures = _run(build(""), "no guidance")
     failures += _run(build(HOSTILE_GUIDANCE), "hostile guidance")
+    failures += _review(build_provider(config))
 
     print(f"TOTAL failures: {failures}")
     return 1 if failures else 0
