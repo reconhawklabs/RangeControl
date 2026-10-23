@@ -10,17 +10,13 @@ BASE_ENV = {
 }
 
 
-def test_builds_anthropic_provider():
-    cfg = load_config({**BASE_ENV, "LLM_PROVIDER": "anthropic"})
-    assert isinstance(build_provider(cfg), AnthropicProvider)
+def test_builds_the_configured_vendor():
+    for name, expected in (("anthropic", AnthropicProvider), ("gemini", GeminiProvider)):
+        cfg = load_config({**BASE_ENV, "LLM_PROVIDER": name})
+        assert isinstance(build_provider(cfg), expected)
 
 
-def test_builds_gemini_provider():
-    cfg = load_config({**BASE_ENV, "LLM_PROVIDER": "gemini"})
-    assert isinstance(build_provider(cfg), GeminiProvider)
-
-
-def test_gate_provider_uses_gate_model():
+def test_gate_provider_uses_the_gate_model():
     cfg = load_config(
         {**BASE_ENV, "LLM_PROVIDER": "anthropic", "LLM_GATE_MODEL": "claude-haiku-4-5"}
     )

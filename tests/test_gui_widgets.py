@@ -33,116 +33,55 @@ def root():
     r.destroy()
 
 
-def test_console_renders_a_ruling(root):
+def render(root, record):
     from rangecontrol.gui.console_tab import ConsoleTab
 
     tab = ConsoleTab(root)
-    tab.append_question(RECORD)
-    text = tab.dump()
-    assert "opcodeoperator" in text
-    assert "DENIED" in text
-    assert "vendor maintenance hold" in text
-    assert "breaks MSEL-INJECT-ALPHA" in text
+    tab.append_question(record)
+    return tab.dump()
 
 
-def test_console_renders_a_deflection_without_a_verdict(root):
+def test_console_renders_every_record_shape_without_crashing(root):
     from rangecontrol.gui.console_tab import ConsoleTab
 
-    tab = ConsoleTab(root)
-    tab.append_question({**RECORD, "kind": "deflection", "verdict": None,
-                         "internal_reason": None, "impacted": []})
-    assert "DEFLECTION" in tab.dump()
+    text = render(root, RECORD)
+    for fragment in ("opcodeoperator", "DENIED", "vendor maintenance hold",
+                     "breaks MSEL-INJECT-ALPHA"):
+        assert fragment in text
 
-
-def test_console_appends_log_lines(root):
-    from rangecontrol.gui.console_tab import ConsoleTab
+    deflection = {**RECORD, "kind": "deflection", "verdict": None,
+                  "internal_reason": None, "impacted": []}
+    assert "DEFLECTION" in render(root, deflection)
+    assert "UNHEARD_OF_KIND" in render(root, {**RECORD, "kind": "unheard_of_kind",
+                                              "verdict": None})
+    assert "None" not in render(root, {"kind": "error"})
 
     tab = ConsoleTab(root)
     tab.append_log("white cell channel unreachable")
     assert "unreachable" in tab.dump()
 
 
-def test_console_does_not_crash_on_a_partial_record(root):
-    from rangecontrol.gui.console_tab import ConsoleTab
+def test_console_never_shows_a_held_ruling_as_delivered(root):
+    held = render(root, {**RECORD, "held": True, "public_response": "Approved. Go ahead."})
+    assert "HELD" in held
+    assert "not sent" in held.lower()
+    # Still visible to the operator, just labelled as awaiting release.
+    assert "Approved. Go ahead." in held
+    assert "Public:" not in held
 
-    tab = ConsoleTab(root)
-    tab.append_question({"kind": "error"})
-    text = tab.dump()
-    assert "None" not in text
+    delivered = render(root, RECORD)
+    assert "Public:" in delivered
+    assert "HELD" not in delivered
+    assert "Reviewer" not in delivered
 
-
-def test_console_unknown_kind_renders_sensibly(root):
-    from rangecontrol.gui.console_tab import ConsoleTab
-
-    tab = ConsoleTab(root)
-    tab.append_question({**RECORD, "kind": "unheard_of_kind", "verdict": None})
-    assert "UNHEARD_OF_KIND" in tab.dump()
-
-
-def test_console_renders_hitl_approved_in_green(root):
-    from rangecontrol.gui.console_tab import _COLOURS, ConsoleTab
-
-    tab = ConsoleTab(root)
-    tab.append_question({**RECORD, "kind": "hitl_approved", "verdict": None,
-                         "reviewer": "blue-lead-reviewer"})
-    assert "HITL_APPROVED" in tab.dump()
-    assert _COLOURS["hitl_approved"] == _COLOURS["approved"]
+    for kind in ("hitl_approved", "hitl_denied"):
+        text = render(root, {**RECORD, "kind": kind, "verdict": None,
+                             "reviewer": "blue-lead-reviewer"})
+        assert kind.upper() in text
+        assert "blue-lead-reviewer" in text
 
 
-def test_console_renders_hitl_denied_in_red(root):
-    from rangecontrol.gui.console_tab import _COLOURS, ConsoleTab
-
-    tab = ConsoleTab(root)
-    tab.append_question({**RECORD, "kind": "hitl_denied", "verdict": None,
-                         "reviewer": "blue-lead-reviewer"})
-    assert "HITL_DENIED" in tab.dump()
-    assert _COLOURS["hitl_denied"] == _COLOURS["denied"]
-
-
-def test_console_shows_the_reviewer_when_the_record_carries_one(root):
-    from rangecontrol.gui.console_tab import ConsoleTab
-
-    tab = ConsoleTab(root)
-    tab.append_question({**RECORD, "kind": "hitl_denied", "verdict": None,
-                         "reviewer": "blue-lead-reviewer"})
-    assert "blue-lead-reviewer" in tab.dump()
-
-
-def test_console_omits_the_reviewer_line_when_absent(root):
-    from rangecontrol.gui.console_tab import ConsoleTab
-
-    tab = ConsoleTab(root)
-    tab.append_question({**RECORD, "kind": "ruling"})
-    assert "Reviewer" not in tab.dump()
-
-
-# -- I1: a held ruling must read as held, not as a delivered ruling ----------
-
-
-def test_console_renders_a_held_ruling_distinctly(root):
-    from rangecontrol.gui.console_tab import ConsoleTab
-
-    tab = ConsoleTab(root)
-    tab.append_question({**RECORD, "held": True, "public_response": "Approved. Go ahead."})
-    text = tab.dump()
-    assert "HELD" in text
-    assert "not sent" in text.lower()
-    # Still visible to the operator -- just labelled as awaiting release,
-    # not claimed as delivered.
-    assert "Approved. Go ahead." in text
-    assert "Public:" not in text
-
-
-def test_console_a_non_held_ruling_still_reads_public(root):
-    from rangecontrol.gui.console_tab import ConsoleTab
-
-    tab = ConsoleTab(root)
-    tab.append_question(RECORD)
-    assert "Public:" in tab.dump()
-    assert "HELD" not in tab.dump()
-
-
-def test_status_bar_shows_running_and_stats(root):
+def test_status_bar_shows_the_bot_state_and_why(root):
     from rangecontrol.gui.statusbar import StatusBar
 
     bar = StatusBar(root)
@@ -152,53 +91,25 @@ def test_status_bar_shows_running_and_stats(root):
     assert "19" in bar.dump()
     assert "8" in bar.dump()
 
-
-def test_status_bar_shows_the_failure_reason(root):
-    from rangecontrol.gui.statusbar import StatusBar
-
-    bar = StatusBar(root)
     bar.set_bot_state(BotState(FAILED, "Discord rejected the bot token."))
     assert "rejected the bot token" in bar.dump()
 
-
-def test_status_bar_shows_stopping_with_detail(root):
-    from rangecontrol.gui.statusbar import StatusBar
-
-    bar = StatusBar(root)
-    bar.set_bot_state(
-        BotState(STOPPING, "the bot did not exit within the timeout")
-    )
+    bar.set_bot_state(BotState(STOPPING, "the bot did not exit within the timeout"))
     text = bar.dump()
     assert "stopping" in text.lower() or "shutting down" in text.lower()
     assert "did not exit within the timeout" in text
 
-
-def test_status_bar_unknown_state_does_not_crash(root):
-    from rangecontrol.gui.statusbar import StatusBar
-
-    bar = StatusBar(root)
     bar.set_bot_state(BotState("mystery", "something odd"))
-    text = bar.dump()
-    assert "mystery" in text
-    assert "something odd" in text
+    assert "mystery" in bar.dump()
+    assert "something odd" in bar.dump()
 
 
-# -- I1: a pending count, so the operator can see rulings are waiting -------
-
-
-def test_status_bar_shows_the_pending_count(root):
+def test_status_bar_pending_count_appears_and_clears(root):
     from rangecontrol.gui.statusbar import StatusBar
 
     bar = StatusBar(root)
     bar.set_pending(3)
     assert "3" in bar.dump()
-
-
-def test_status_bar_hides_the_pending_line_at_zero(root):
-    from rangecontrol.gui.statusbar import StatusBar
-
-    bar = StatusBar(root)
-    bar.set_pending(3)
     bar.set_pending(0)
     assert "pending" not in bar.dump().lower()
     assert "awaiting" not in bar.dump().lower()

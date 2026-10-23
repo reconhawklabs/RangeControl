@@ -1,10 +1,11 @@
 import pytest
 
 from rangecontrol.ingest.cache import ExtractionCache
-from rangecontrol.ingest.discovery import build_corpus, discover
-from rangecontrol.ingest.extractors.registry import EXTRACTOR_VERSION, extractor_for
-from tests.support.stub_provider import StubProvider
+from rangecontrol.ingest.discovery import MAX_DOC_CHARS, _record, build_corpus, discover
+from rangecontrol.ingest.extractors.embedded import EMBEDDED_IMAGES_HEADER
+from rangecontrol.ingest.extractors.registry import cache_version, extractor_for
 from tests.support.images import write_png
+from tests.support.stub_provider import StubProvider
 
 
 @pytest.fixture()
@@ -14,104 +15,65 @@ def resources(tmp_path):
     (root / "notes.txt").write_text("standing rules", encoding="utf-8")
     (root / "network" / "topology.md").write_text("segment A to B", encoding="utf-8")
     (root / ".hidden.txt").write_text("ignore me", encoding="utf-8")
+    (root / ".git").mkdir()
+    (root / ".git" / "config").write_text("x", encoding="utf-8")
     return root
 
 
-def test_discover_walks_recursively_and_sorts(resources):
+def test_discover_walks_recursively_sorted_and_skips_hidden_paths(resources, tmp_path):
     found = [p.relative_to(resources).as_posix() for p in discover(resources)]
     assert found == ["network/topology.md", "notes.txt"]
-
-
-def test_discover_skips_hidden_files(resources):
-    assert all(not p.name.startswith(".") for p in discover(resources))
-
-
-def test_discover_skips_hidden_directories(resources):
-    hidden = resources / ".git"
-    hidden.mkdir()
-    (hidden / "config").write_text("x", encoding="utf-8")
-    assert all(".git" not in str(p) for p in discover(resources))
-
-
-def test_discover_returns_empty_for_missing_directory(tmp_path):
     assert discover(tmp_path / "nope") == ()
 
 
-def test_build_corpus_extracts_every_file(resources, tmp_path):
-    corpus = build_corpus(resources, StubProvider(), ExtractionCache(tmp_path / "c"))
-    bodies = {d.path: d.text for d in corpus.readable()}
-    assert bodies["notes.txt"] == "standing rules"
-    assert bodies["network/topology.md"] == "segment A to B"
-
-
-def test_paths_are_relative_and_posix_style(resources, tmp_path):
-    corpus = build_corpus(resources, StubProvider(), ExtractionCache(tmp_path / "c"))
-    assert "network/topology.md" in {d.path for d in corpus.docs}
-
-
-def test_unreadable_file_is_recorded_not_raised(resources, tmp_path):
+def test_unreadable_and_blank_files_are_recorded_never_raised_or_rendered(resources, tmp_path):
+    """No readable doc may have blank text: a blank body would render into the
+    model context as a header for a document the adjudicator never received."""
     (resources / "broken.pdf").write_bytes(b"not a pdf")
-    corpus = build_corpus(resources, StubProvider(), ExtractionCache(tmp_path / "c"))
-    unreadable = {d.path: d.error for d in corpus.unreadable()}
-    assert "broken.pdf" in unreadable
-    assert unreadable["broken.pdf"]
-    # The other two files still extracted.
-    assert len(corpus.readable()) == 2
-
-
-def test_empty_text_file_is_recorded_as_unreadable(resources, tmp_path):
     (resources / "empty.txt").write_text("", encoding="utf-8")
-    corpus = build_corpus(resources, StubProvider(), ExtractionCache(tmp_path / "c"))
-    assert "empty.txt" in {d.path for d in corpus.unreadable()}
-    assert all(d.text.strip() for d in corpus.readable())
-
-
-def test_whitespace_only_file_is_recorded_as_unreadable(resources, tmp_path):
     (resources / "blank.md").write_text("   \n\t\n", encoding="utf-8")
-    corpus = build_corpus(resources, StubProvider(), ExtractionCache(tmp_path / "c"))
-    assert "blank.md" in {d.path for d in corpus.unreadable()}
-
-
-def test_empty_cache_entry_is_recorded_as_unreadable(resources, tmp_path):
+    replayed = resources / "replayed.txt"
+    replayed.write_text("real content", encoding="utf-8")
     cache = ExtractionCache(tmp_path / "c")
-    target = resources / "notes.txt"
-    kind, _ = extractor_for(target)
-    cache.put(target, f"{EXTRACTOR_VERSION}-{kind}", "")
+    cache.put(replayed, cache_version(extractor_for(replayed)[0]), "")
+
     corpus = build_corpus(resources, StubProvider(), cache)
-    assert "notes.txt" in {d.path for d in corpus.unreadable()}
 
-
-def test_no_readable_doc_ever_has_blank_text(resources, tmp_path):
-    (resources / "empty.txt").write_text("", encoding="utf-8")
-    (resources / "blank.md").write_text("  \n", encoding="utf-8")
-    corpus = build_corpus(resources, StubProvider(), ExtractionCache(tmp_path / "c"))
+    assert {d.path: d.text for d in corpus.readable()} == {
+        "network/topology.md": "segment A to B",
+        "notes.txt": "standing rules",
+    }
+    unreadable = {d.path: d.error for d in corpus.unreadable()}
+    assert set(unreadable) == {"broken.pdf", "empty.txt", "blank.md", "replayed.txt"}
+    assert all(unreadable.values())
     rendered = corpus.to_prompt_text()
-    assert "empty.txt" not in rendered
-    assert "blank.md" not in rendered
+    for name in unreadable:
+        assert name not in rendered
 
 
-def test_second_run_uses_cache_and_skips_the_provider(resources, tmp_path):
-    write_png((resources / "diagram.png"))
+def test_second_run_uses_cache_skips_the_provider_and_renders_identical_bytes(resources, tmp_path):
+    """The rendered corpus is the cached prompt prefix: a cache replay that
+    differed by one byte from the fresh extraction would miss it every run."""
+    write_png(resources / "diagram.png")
     cache = ExtractionCache(tmp_path / "c")
 
     first = StubProvider(image_text="a diagram")
-    build_corpus(resources, first, cache)
+    fresh = build_corpus(resources, first, cache)
     assert len(first.image_calls) == 1
 
     second = StubProvider(image_text="a diagram")
-    corpus = build_corpus(resources, second, cache)
+    replayed = build_corpus(resources, second, cache)
     assert second.image_calls == []
-    assert any(d.text == "a diagram" for d in corpus.readable())
+    assert any(d.text == "a diagram" for d in replayed.readable())
+    assert replayed.to_prompt_text() == fresh.to_prompt_text()
 
 
-def test_an_enormous_file_is_truncated_and_flagged(resources, tmp_path):
+def test_an_enormous_file_is_truncated_flagged_and_keeps_image_descriptions(resources, tmp_path):
     """A 300 MB packet log would otherwise go into every ruling's prompt and
     fail the API call with an unhelpful 400. The head is kept, the cut is
-    marked in the text, and the report can name the file."""
-    from rangecontrol.ingest.discovery import MAX_DOC_CHARS
-
-    big = resources / "huge.log"
-    big.write_text("x" * (MAX_DOC_CHARS + 500), encoding="utf-8")
+    marked in the text, and the report can name the file. Embedded image
+    descriptions are paid for, so the cut lands in the text ahead of them."""
+    (resources / "huge.log").write_text("x" * (MAX_DOC_CHARS + 500), encoding="utf-8")
     corpus = build_corpus(resources, StubProvider(), ExtractionCache(tmp_path / "c"))
     doc = next(d for d in corpus.docs if d.path == "huge.log")
     assert doc.error is None
@@ -120,17 +82,9 @@ def test_an_enormous_file_is_truncated_and_flagged(resources, tmp_path):
     assert "truncated" in doc.text[-200:].lower()
     assert corpus.truncated_docs() == (doc,)
 
-
-def test_truncation_keeps_the_embedded_image_descriptions(resources, tmp_path):
-    """The descriptions are paid for and, for a scanned brief, the only
-    part that matters; the cut lands in the text ahead of them."""
-    from rangecontrol.ingest.discovery import MAX_DOC_CHARS, _record
-    from rangecontrol.ingest.extractors.embedded import EMBEDDED_IMAGES_HEADER
-
-    body = "t" * (MAX_DOC_CHARS + 1000)
     images = f"{EMBEDDED_IMAGES_HEADER}\n[page 1 image 1]\nFW-1 joins HQ-LAN to DMZ."
-    doc = _record("brief.pdf", "pdf", f"{body}\n\n{images}")
-    assert doc.truncated
-    assert doc.text.endswith("FW-1 joins HQ-LAN to DMZ.")
-    assert "TRUNCATED" in doc.text
-    assert len(doc.text) <= MAX_DOC_CHARS + 400
+    brief = _record("brief.pdf", "pdf", f"{'t' * (MAX_DOC_CHARS + 1000)}\n\n{images}")
+    assert brief.truncated
+    assert brief.text.endswith("FW-1 joins HQ-LAN to DMZ.")
+    assert "TRUNCATED" in brief.text
+    assert len(brief.text) <= MAX_DOC_CHARS + 400

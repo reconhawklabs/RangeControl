@@ -1,3 +1,6 @@
+import threading
+import time
+
 import pytest
 
 from rangecontrol.llm.base import LLMError, Provider
@@ -18,6 +21,8 @@ class FakeModels:
 
 
 class FakeClient:
+    """No ``caches`` attribute: older SDKs and plain doubles look like this."""
+
     def __init__(self, models):
         self.models = models
 
@@ -28,191 +33,106 @@ def build(text=None, error=None):
     return provider, models
 
 
-def test_satisfies_provider_protocol():
-    provider, _ = build("ok")
-    assert isinstance(provider, Provider)
+def returning(response):
+    """A provider whose SDK hands back exactly ``response``."""
+
+    class Models:
+        def generate_content(self, **kwargs):
+            return response
+
+    return GeminiProvider(api_key="k", model="gemini-2.5-pro", client=FakeClient(Models()))
 
 
-def test_returns_text():
-    provider, _ = build("hello")
-    assert provider.complete(system="s", user="u") == "hello"
+def finished(reason, text):
+    candidate = type("Candidate", (), {"finish_reason": reason})()
+    return type("R", (), {"candidates": [candidate], "text": text})()
 
 
-def test_system_prompt_goes_in_system_instruction():
-    provider, models = build("ok")
-    provider.complete(system="sys", user="usr")
-    assert models.kwargs["config"]["system_instruction"] == "sys"
-    assert models.kwargs["contents"] == "usr"
+class ExplodingText:
+    @property
+    def text(self):
+        raise RuntimeError("malformed candidate list")
 
 
-def test_schema_sets_json_mime_type_and_response_schema():
-    schema = {"type": "object", "properties": {}, "required": [], "additionalProperties": False}
-    provider, models = build("{}")
-    provider.complete(system="s", user="u", schema=schema)
-    assert models.kwargs["config"]["response_mime_type"] == "application/json"
-    # Sent sanitized: Gemini 400s on additionalProperties, which Anthropic requires.
-    assert models.kwargs["config"]["response_schema"] == {
-        "type": "object",
-        "properties": {},
-        "required": [],
+def test_every_unusable_response_fails_closed_with_llm_error():
+    """Truncation and safety stops can arrive with partial text attached; that
+    text must never be returned as if it were a complete answer."""
+    assert returning(finished("STOP", "a complete answer")).complete(
+        system="s", user="u"
+    ) == "a complete answer"
+
+    with pytest.raises(LLMError, match="truncated"):
+        returning(finished("MAX_TOKENS", "a partial document that stops mid-")).complete(
+            system="s", user="u"
+        )
+    with pytest.raises(LLMError, match="SAFETY"):
+        returning(finished("SAFETY", "a partial answer cut off by the filt")).complete(
+            system="s", user="u"
+        )
+
+    cases = {
+        "no text attribute": returning(type("NoText", (), {"candidates": []})()),
+        "raising text property": returning(ExplodingText()),
+        "blank text": build("   ")[0],
+        "none text": build(None)[0],
+        "sdk exception": build(error=RuntimeError("network down"))[0],
     }
+    escaped = []
+    for label, provider in cases.items():
+        try:
+            provider.complete(system="s", user="u")
+        except LLMError:
+            continue
+        escaped.append(label)
+    assert escaped == []
 
 
-def test_truncated_response_raises():
-    class Candidate:
-        finish_reason = "MAX_TOKENS"
+def test_request_carries_system_relaxed_safety_and_a_gemini_safe_schema():
+    """Gemini 400s on additionalProperties, which Anthropic's strict mode
+    requires; the shared schema constants must keep it for the Anthropic side."""
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "verdict": {"type": "string", "enum": ["APPROVED", "DENIED"]},
+            "items": {
+                "type": "array",
+                "items": {"type": "object", "additionalProperties": False},
+            },
+        },
+        "required": ["verdict"],
+    }
+    provider, models = build("{}")
+    assert isinstance(provider, Provider)
+    provider.complete(system="sys", user="usr", schema=schema)
 
-    class Truncated:
-        candidates = [Candidate()]
-        text = "a partial document that stops mid-"
+    config = models.kwargs["config"]
+    assert config["system_instruction"] == "sys"
+    assert models.kwargs["contents"] == "usr"
+    assert config["response_mime_type"] == "application/json"
+    assert config["response_schema"] == {
+        "type": "object",
+        "properties": {
+            "verdict": {"type": "string", "enum": ["APPROVED", "DENIED"]},
+            "items": {"type": "array", "items": {"type": "object"}},
+        },
+        "required": ["verdict"],
+    }
+    # The caller's schema is untouched at every depth.
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["items"]["items"]["additionalProperties"] is False
 
-    class Models:
-        def generate_content(self, **kwargs):
-            return Truncated()
-
-    class Client:
-        models = Models()
-
-    provider = GeminiProvider(api_key="k", model="gemini-2.5-pro", client=Client())
-    with pytest.raises(LLMError) as exc:
-        provider.complete(system="s", user="u")
-    assert "truncated" in str(exc.value).lower()
-
-
-def test_stop_finish_reason_still_succeeds():
-    class Candidate:
-        finish_reason = "STOP"
-
-    class Complete:
-        candidates = [Candidate()]
-        text = "a complete answer"
-
-    class Models:
-        def generate_content(self, **kwargs):
-            return Complete()
-
-    class Client:
-        models = Models()
-
-    provider = GeminiProvider(api_key="k", model="gemini-2.5-pro", client=Client())
-    assert provider.complete(system="s", user="u") == "a complete answer"
-
-
-def test_safety_finish_reason_raises():
-    class Candidate:
-        finish_reason = "SAFETY"
-
-    class Blocked:
-        candidates = [Candidate()]
-        text = "a partial answer that got cut off by the safety filt"
-
-    class Models:
-        def generate_content(self, **kwargs):
-            return Blocked()
-
-    class Client:
-        models = Models()
-
-    provider = GeminiProvider(api_key="k", model="gemini-2.5-pro", client=Client())
-    with pytest.raises(LLMError) as exc:
-        provider.complete(system="s", user="u")
-    assert "safety" in str(exc.value).lower()
+    settings = config["safety_settings"]
+    assert all(item["threshold"] == "BLOCK_ONLY_HIGH" for item in settings)
+    assert any(item["category"] == "HARM_CATEGORY_DANGEROUS_CONTENT" for item in settings)
 
 
-def test_missing_text_attribute_raises():
-    class NoText:
-        candidates = []
-
-    class Models:
-        def generate_content(self, **kwargs):
-            return NoText()
-
-    class Client:
-        models = Models()
-
-    provider = GeminiProvider(api_key="k", model="gemini-2.5-pro", client=Client())
-    with pytest.raises(LLMError):
-        provider.complete(system="s", user="u")
-
-
-def test_empty_response_raises():
-    provider, _ = build("   ")
-    with pytest.raises(LLMError):
-        provider.complete(system="s", user="u")
-
-
-def test_none_response_raises():
-    provider, _ = build(None)
-    with pytest.raises(LLMError):
-        provider.complete(system="s", user="u")
-
-
-def test_sdk_exception_is_wrapped():
-    provider, _ = build(error=RuntimeError("network down"))
-    with pytest.raises(LLMError):
-        provider.complete(system="s", user="u")
-
-
-def test_raising_text_property_becomes_llm_error():
-    class Exploding:
-        @property
-        def text(self):
-            raise RuntimeError("malformed candidate list")
-
-    class Models:
-        def generate_content(self, **kwargs):
-            return Exploding()
-
-    class Client:
-        models = Models()
-
-    provider = GeminiProvider(api_key="k", model="gemini-2.5-pro", client=Client())
-    with pytest.raises(LLMError):
-        provider.complete(system="s", user="u")
-
-
-def test_describe_image_sends_inline_part():
+def test_describe_image_sends_an_inline_part():
     provider, models = build("a diagram")
     assert provider.describe_image(data=b"x", mime_type="image/png", prompt="p") == "a diagram"
     parts = models.kwargs["contents"]
     assert parts[0]["inline_data"]["mime_type"] == "image/png"
     assert parts[1] == "p"
-
-
-def test_schema_is_stripped_of_keys_gemini_rejects():
-    """Gemini 400s on additionalProperties; Anthropic's strict mode requires it."""
-    from rangecontrol.advisor.prompts import RULING_SCHEMA
-
-    provider, models = build("{}")
-    provider.complete(system="s", user="u", schema=RULING_SCHEMA)
-    sent = models.kwargs["config"]["response_schema"]
-    assert "additionalProperties" not in sent
-    assert sent["type"] == "object"
-    assert set(sent["required"]) == set(RULING_SCHEMA["required"])
-    assert sent["properties"]["verdict"]["enum"] == ["APPROVED", "DENIED"]
-
-
-def test_stripping_does_not_mutate_the_shared_schema():
-    """The schema constants are shared with the Anthropic adapter, which needs the key."""
-    from rangecontrol.advisor.prompts import RULING_SCHEMA
-
-    provider, _ = build("{}")
-    provider.complete(system="s", user="u", schema=RULING_SCHEMA)
-    assert RULING_SCHEMA["additionalProperties"] is False
-
-
-def test_nested_object_schemas_are_stripped_recursively():
-    nested = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {"inner": {"type": "object", "additionalProperties": False}},
-        "required": ["inner"],
-    }
-    provider, models = build("{}")
-    provider.complete(system="s", user="u", schema=nested)
-    sent = models.kwargs["config"]["response_schema"]
-    assert "additionalProperties" not in sent
-    assert "additionalProperties" not in sent["properties"]["inner"]
 
 
 # --- context caching -------------------------------------------------------
@@ -243,62 +163,51 @@ class CachingClient:
         self.caches = caches
 
 
-def build_caching(text="ok", error=None, cache_error=None):
-    models = FakeModels(text=text, error=error)
-    caches = FakeCaches(error=cache_error)
+def build_caching(models=None, caches=None):
+    models = models or FakeModels(text="ok")
+    caches = caches or FakeCaches()
     provider = GeminiProvider(
         api_key="k", model="gemini-2.5-pro", client=CachingClient(models, caches)
     )
     return provider, models, caches
 
 
-def test_large_context_is_cached_and_referenced_instead_of_resent():
+def test_the_standing_context_is_cached_once_and_referenced_instead_of_resent():
     provider, models, caches = build_caching()
-    provider.complete(system=BIG_SYSTEM, user="u")
+    for _ in range(3):
+        provider.complete(system=BIG_SYSTEM, user="u")
+    assert len(caches.calls) == 1
     assert caches.calls[0]["config"]["system_instruction"] == BIG_SYSTEM
     assert models.kwargs["config"]["cached_content"] == "cachedContents/abc"
     # Both together is a 400 from the API, and re-sending defeats the point.
     assert "system_instruction" not in models.kwargs["config"]
 
-
-def test_cache_is_created_once_and_reused_across_questions():
-    provider, models, caches = build_caching()
-    for _ in range(3):
-        provider.complete(system=BIG_SYSTEM, user="u")
-    assert len(caches.calls) == 1
-    assert models.kwargs["config"]["cached_content"] == "cachedContents/abc"
-
-
-def test_changed_context_creates_a_new_cache():
-    provider, _, caches = build_caching()
-    provider.complete(system=BIG_SYSTEM, user="u")
     provider.complete(system=BIG_SYSTEM + " revised", user="u")
     assert len(caches.calls) == 2
 
-
-def test_small_context_is_sent_inline_without_a_cache():
-    provider, models, caches = build_caching()
     provider.complete(system="short", user="u")
-    assert caches.calls == []
+    assert len(caches.calls) == 2
     assert models.kwargs["config"]["system_instruction"] == "short"
 
 
-def test_caching_failure_falls_back_to_inline_and_still_answers():
-    provider, models, _ = build_caching(cache_error=RuntimeError("no caching here"))
-    assert provider.complete(system=BIG_SYSTEM, user="u") == "ok"
+def test_caching_failure_falls_back_inline_and_is_not_retried():
+    provider, models, caches = build_caching(caches=FakeCaches(error=RuntimeError("no")))
+    for _ in range(3):
+        assert provider.complete(system=BIG_SYSTEM, user="u") == "ok"
+    assert len(caches.calls) == 1
     assert models.kwargs["config"]["system_instruction"] == BIG_SYSTEM
     assert "cached_content" not in models.kwargs["config"]
 
-
-def test_caching_is_not_retried_after_it_fails_once():
-    provider, _, caches = build_caching(cache_error=RuntimeError("unsupported"))
-    for _ in range(3):
-        provider.complete(system=BIG_SYSTEM, user="u")
-    assert len(caches.calls) == 1
+    # A client with no caches support at all behaves the same way.
+    provider, models = build("ok")
+    assert provider.complete(system=BIG_SYSTEM, user="u") == "ok"
+    assert models.kwargs["config"]["system_instruction"] == BIG_SYSTEM
 
 
-def test_expired_cache_is_retried_inline_rather_than_costing_a_ruling():
-    """A cache can expire mid-exercise; the question must still be answered."""
+def test_an_expired_cache_is_retried_inline_but_model_failures_are_not():
+    """A cache can expire mid-exercise and the question must still be
+    answered. A truncated or blocked response is not a cache problem, so
+    retrying it would pay for the identical failure twice."""
 
     class ExpiringModels:
         def __init__(self):
@@ -311,76 +220,44 @@ def test_expired_cache_is_retried_inline_rather_than_costing_a_ruling():
             return type("R", (), {"text": "ok"})()
 
     models = ExpiringModels()
-    caches = FakeCaches()
-    provider = GeminiProvider(
-        api_key="k", model="gemini-2.5-pro", client=CachingClient(models, caches)
-    )
+    provider, _, _ = build_caching(models=models)
     assert provider.complete(system=BIG_SYSTEM, user="u") == "ok"
     assert models.configs[0]["cached_content"] == "cachedContents/abc"
     assert models.configs[1]["system_instruction"] == BIG_SYSTEM
     assert "cached_content" not in models.configs[1]
 
-
-def test_stale_handle_is_dropped_so_the_next_question_recreates_it():
-    provider, _, caches = build_caching(error=RuntimeError("CachedContent not found"))
-    with pytest.raises(LLMError):
-        provider.complete(system=BIG_SYSTEM, user="u")
-    with pytest.raises(LLMError):
-        provider.complete(system=BIG_SYSTEM, user="u")
+    # The stale handle is dropped, so the next question uploads a fresh one.
+    provider, _, caches = build_caching(models=FakeModels(error=RuntimeError("gone")))
+    for _ in range(2):
+        with pytest.raises(LLMError):
+            provider.complete(system=BIG_SYSTEM, user="u")
     assert len(caches.calls) == 2
 
-
-def test_model_side_failure_is_not_retried():
-    """A truncated or blocked response is not a cache problem.
-
-    Retrying it inline would pay for the identical failure a second time, so
-    only request-layer failures trigger the fallback.
-    """
-
-    class Candidate:
-        finish_reason = type("F", (), {"name": "MAX_TOKENS"})()
-
     class TruncatedModels:
-        def __init__(self):
-            self.count = 0
+        count = 0
 
         def generate_content(self, **kwargs):
             self.count += 1
-            return type("R", (), {"candidates": [Candidate()], "text": "partial"})()
+            return finished(type("F", (), {"name": "MAX_TOKENS"})(), "partial")
 
     models = TruncatedModels()
-    provider = GeminiProvider(
-        api_key="k", model="gemini-2.5-pro", client=CachingClient(models, FakeCaches())
-    )
+    provider, _, _ = build_caching(models=models)
     with pytest.raises(LLMError, match="truncated"):
         provider.complete(system=BIG_SYSTEM, user="u")
     assert models.count == 1
 
 
-def test_a_client_without_caches_support_still_works():
-    """Older SDKs and injected test doubles have no .caches attribute."""
-    provider, models = build("ok")
-    assert provider.complete(system=BIG_SYSTEM, user="u") == "ok"
-    assert models.kwargs["config"]["system_instruction"] == BIG_SYSTEM
-
-
 def test_concurrent_questions_create_the_standing_context_cache_once():
-    """Rulings now run on worker threads, so two questions can arrive at the
+    """Rulings run on worker threads, so two questions can arrive at the
     provider together. Racing them into two cache uploads of the same
     context doubles the cost of the biggest request the bot ever makes."""
-    import threading
-    import time
 
     class SlowCaches(FakeCaches):
         def create(self, **kwargs):
             time.sleep(0.05)
             return super().create(**kwargs)
 
-    caches = SlowCaches()
-    provider = GeminiProvider(
-        api_key="k", model="gemini-2.5-pro",
-        client=CachingClient(FakeModels(text="ok"), caches),
-    )
+    provider, _, caches = build_caching(caches=SlowCaches())
     barrier = threading.Barrier(4)
 
     def ask():
@@ -393,11 +270,3 @@ def test_concurrent_questions_create_the_standing_context_cache_once():
     for thread in threads:
         thread.join()
     assert len(caches.calls) == 1
-
-
-def test_safety_thresholds_are_relaxed_for_range_material():
-    provider, models = build("ok")
-    provider.complete(system="s", user="u")
-    settings = models.kwargs["config"]["safety_settings"]
-    assert all(item["threshold"] == "BLOCK_ONLY_HIGH" for item in settings)
-    assert any(item["category"] == "HARM_CATEGORY_DANGEROUS_CONTENT" for item in settings)

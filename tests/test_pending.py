@@ -8,66 +8,34 @@ def request(n: int = 1) -> PendingRequest:
     )
 
 
-def test_a_stored_request_can_be_taken_back():
-    registry = PendingRegistry()
-    registry.add(999, request())
-    assert registry.take(999).public_text == "reply1"
-
-
-def test_taking_removes_it():
+def test_a_request_can_be_taken_back_only_once():
     """Two white cell members reacting must not release the reply twice."""
     registry = PendingRegistry()
     registry.add(999, request())
-    assert registry.take(999) is not None
+
+    assert registry.take(999).public_text == "reply1"
     assert registry.take(999) is None
+    assert registry.take(12345) is None
 
 
-def test_an_unknown_id_returns_none():
-    assert PendingRegistry().take(12345) is None
-
-
-def test_the_registry_is_bounded():
+def test_the_registry_is_bounded_and_evicts_the_oldest_first():
     """An exercise nobody is reviewing must not grow the process without limit."""
     registry = PendingRegistry()
     for n in range(MAX_PENDING + 10):
         registry.add(n, request(n))
+
     assert len(registry) == MAX_PENDING
+    assert registry.take(9) is None
+    assert registry.take(10) is not None
 
 
-def test_eviction_drops_the_oldest_first():
-    registry = PendingRegistry()
-    for n in range(MAX_PENDING + 1):
-        registry.add(n, request(n))
-    assert registry.take(0) is None
-    assert registry.take(MAX_PENDING) is not None
-
-
-# -- on_change: lets the GUI publish a live pending count --------------------
-
-
-def test_on_change_fires_after_add():
+def test_on_change_reports_the_live_count_only_when_it_changes():
+    """Feeds the GUI's "N awaiting review" count."""
     seen = []
     registry = PendingRegistry(on_change=seen.append)
-    registry.add(1, request())
-    assert seen == [1]
 
-
-def test_on_change_fires_after_take():
-    seen = []
-    registry = PendingRegistry(on_change=seen.append)
     registry.add(1, request())
     registry.take(1)
+    registry.take(1)  # nothing left to take
+
     assert seen == [1, 0]
-
-
-def test_on_change_does_not_fire_when_take_finds_nothing():
-    seen = []
-    registry = PendingRegistry(on_change=seen.append)
-    registry.take(999)
-    assert seen == []
-
-
-def test_on_change_is_optional():
-    registry = PendingRegistry()
-    registry.add(1, request())  # must not raise
-    registry.take(1)  # must not raise

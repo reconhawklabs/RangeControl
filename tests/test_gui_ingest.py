@@ -3,8 +3,8 @@ import queue
 import pytest
 
 from rangecontrol.config import load_config
-from rangecontrol.gui.events import INGEST
-from rangecontrol.gui.runtime import IngestJob
+from rangecontrol.gui.events import INGEST, MODELS
+from rangecontrol.gui.runtime import IngestJob, ModelsJob
 from rangecontrol.llm.base import LLMError
 from rangecontrol.range_doc.loader import REQUIRED_SECTIONS
 from tests.support.stub_provider import StubProvider
@@ -28,12 +28,14 @@ def with_resources(tmp_path):
     return tmp_path
 
 
-def test_successful_ingest_publishes_the_outcome(tmp_path):
+def test_ingest_then_regenerate_publish_their_outcomes(tmp_path):
     with_resources(tmp_path)
     (tmp_path / "Range.md").write_text(COMPLETE, encoding="utf-8")
     events = queue.Queue()
-    IngestJob(config_for(tmp_path), events, regenerate=False,
-              provider_factory=lambda cfg: StubProvider()).run()
+    thread = IngestJob(config_for(tmp_path), events, regenerate=False,
+                       provider_factory=lambda cfg: StubProvider()).start()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
 
     event = events.get_nowait()
     assert event.kind == INGEST
@@ -41,84 +43,49 @@ def test_successful_ingest_publishes_the_outcome(tmp_path):
     assert event.payload.report.total_files == 1
     assert "segment A" in event.payload.corpus_text
 
-
-def test_provider_failure_is_reported_not_raised(tmp_path):
-    """A worker thread that raises takes down the app silently."""
-    with_resources(tmp_path)
-    events = queue.Queue()
-    IngestJob(
-        config_for(tmp_path), events, regenerate=False,
-        provider_factory=lambda cfg: StubProvider(error=LLMError("bad key")),
-    ).run()
-
-    event = events.get_nowait()
-    assert event.kind == INGEST
-    assert event.payload.ok is False
-    assert "bad key" in event.payload.error
-
-
-def test_missing_resources_is_reported_cleanly(tmp_path):
-    events = queue.Queue()
-    IngestJob(config_for(tmp_path), events, regenerate=False,
-              provider_factory=lambda cfg: StubProvider()).run()
-    event = events.get_nowait()
-    assert event.payload.ok is False
-    assert "resources" in event.payload.error
-
-
-def test_regenerate_clears_the_cache(tmp_path):
-    with_resources(tmp_path)
-    (tmp_path / "Range.md").write_text(COMPLETE, encoding="utf-8")
+    # Regenerate throws away cached extractions before rebuilding.
     cache = tmp_path / ".rangecontrol" / "cache"
-    cache.mkdir(parents=True)
+    cache.mkdir(parents=True, exist_ok=True)
     (cache / "1-stale.txt").write_text("stale", encoding="utf-8")
-
-    events = queue.Queue()
     IngestJob(
         config_for(tmp_path), events, regenerate=True,
         provider_factory=lambda cfg: StubProvider(completions=[COMPLETE]),
     ).run()
-
     assert not (cache / "1-stale.txt").exists()
     assert events.get_nowait().payload.ok is True
 
 
-def test_bare_exception_is_reported_not_raised(tmp_path):
-    """The trailing `except Exception` clause is this task's central
-    guarantee -- exercise it directly rather than only via LLMError."""
-    with_resources(tmp_path)
-    events = queue.Queue()
+def test_any_failure_is_published_as_an_outcome_not_raised(tmp_path, monkeypatch):
+    """A worker thread that raises dies silently and the GUI waits forever."""
 
-    def boom(cfg):
+    def kaboom(cfg):
         raise Exception("kaboom")
-
-    IngestJob(config_for(tmp_path), events, regenerate=False,
-              provider_factory=boom).run()
-
-    event = events.get_nowait()
-    assert event.kind == INGEST
-    assert event.payload.ok is False
-    assert "Exception: kaboom" in event.payload.error
-
-
-def test_unexpected_exception_from_prepare_is_reported_not_raised(tmp_path, monkeypatch):
-    """A failure inside prepare() itself, not just the provider factory,
-    must still resolve to a clean outcome via the broad except clause."""
-    with_resources(tmp_path)
-    events = queue.Queue()
 
     def broken_prepare(config, provider, *, regenerate):
         raise TypeError("not a range")
 
-    monkeypatch.setattr("rangecontrol.gui.runtime.prepare", broken_prepare)
+    cases = [
+        ("no-resources", lambda cfg: StubProvider(), None, "resources"),
+        ("bad-key", lambda cfg: StubProvider(error=LLMError("bad key")), None, "bad key"),
+        ("bare-exception", kaboom, None, "Exception: kaboom"),
+        ("prepare-raises", lambda cfg: StubProvider(), broken_prepare, "TypeError: not a range"),
+    ]
+    for name, factory, prepare, expected in cases:
+        home = tmp_path / name
+        home.mkdir()
+        if name != "no-resources":
+            with_resources(home)
+        events = queue.Queue()
+        with monkeypatch.context() as m:
+            if prepare is not None:
+                m.setattr("rangecontrol.gui.runtime.prepare", prepare)
+            IngestJob(config_for(home), events, regenerate=False,
+                      provider_factory=factory).run()
 
-    IngestJob(config_for(tmp_path), events, regenerate=False,
-              provider_factory=lambda cfg: StubProvider()).run()
-
-    event = events.get_nowait()
-    assert event.kind == INGEST
-    assert event.payload.ok is False
-    assert "TypeError: not a range" in event.payload.error
+        event = events.get_nowait()
+        assert event.kind == INGEST, name
+        assert event.payload.ok is False, name
+        assert expected in event.payload.error, name
 
 
 def test_system_exit_is_reported_then_reraised(tmp_path):
@@ -140,37 +107,17 @@ def test_system_exit_is_reported_then_reraised(tmp_path):
     assert "SystemExit: shutting down" in event.payload.error
 
 
-def test_start_returns_a_running_thread(tmp_path):
-    with_resources(tmp_path)
-    (tmp_path / "Range.md").write_text(COMPLETE, encoding="utf-8")
+def test_models_job_publishes_the_list_or_the_reason_it_failed(tmp_path):
+    """A dropdown that silently fails to repopulate explains nothing."""
     events = queue.Queue()
-    thread = IngestJob(config_for(tmp_path), events, regenerate=False,
-                       provider_factory=lambda cfg: StubProvider()).start()
+    thread = ModelsJob(config_for(tmp_path), events,
+                       lister=lambda cfg: ("gemini-9-flash", "gemini-9-pro")).start()
     thread.join(timeout=10)
     assert not thread.is_alive()
-    assert events.get_nowait().kind == INGEST
-
-
-# --- fetching the model list -----------------------------------------------
-
-
-def test_models_job_publishes_what_the_provider_returned(tmp_path):
-    events = queue.Queue()
-    from rangecontrol.gui.events import MODELS
-    from rangecontrol.gui.runtime import ModelsJob
-
-    ModelsJob(config_for(tmp_path), events,
-              lister=lambda cfg: ("gemini-9-flash", "gemini-9-pro")).run()
     event = events.get_nowait()
     assert event.kind == MODELS
     assert event.payload.ok is True
     assert event.payload.models == ("gemini-9-flash", "gemini-9-pro")
-
-
-def test_models_job_reports_a_failure_rather_than_raising(tmp_path):
-    """A dropdown that silently fails to repopulate explains nothing."""
-    events = queue.Queue()
-    from rangecontrol.gui.runtime import ModelsJob
 
     def boom(cfg):
         raise LLMError("Could not list Gemini models: AuthenticationError")
@@ -179,13 +126,3 @@ def test_models_job_reports_a_failure_rather_than_raising(tmp_path):
     outcome = events.get_nowait().payload
     assert outcome.ok is False
     assert "AuthenticationError" in outcome.error
-
-
-def test_models_job_thread_finishes(tmp_path):
-    events = queue.Queue()
-    from rangecontrol.gui.runtime import ModelsJob
-
-    thread = ModelsJob(config_for(tmp_path), events, lister=lambda cfg: ("m",)).start()
-    thread.join(timeout=10)
-    assert not thread.is_alive()
-    assert events.get_nowait().payload.models == ("m",)

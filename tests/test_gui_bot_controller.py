@@ -139,142 +139,99 @@ def wait_for(controller, state, timeout=5.0):
     return False
 
 
-def test_starts_and_reports_running():
+START = {"config": object(), "advisor": object(), "audit": object()}
+
+
+def states_in(events):
+    return [e.payload.state for e in drain(events) if e.kind == STATUS]
+
+
+def test_start_runs_until_stop_and_publishes_every_transition():
     events = queue.Queue()
     bot = FakeBot()
     controller = BotController(events, bot_factory=lambda **kw: bot)
-    controller.start(config=object(), advisor=object(), audit=object())
-    try:
-        assert wait_for(controller, RUNNING)
-        assert bot.started is True
-    finally:
-        controller.stop()
 
-
-def test_stop_returns_to_stopped():
-    events = queue.Queue()
-    controller = BotController(events, bot_factory=lambda **kw: FakeBot())
-    controller.start(config=object(), advisor=object(), audit=object())
-    assert wait_for(controller, RUNNING)
-    controller.stop()
-    assert controller.state.state == STOPPED
-
-
-def test_a_login_failure_surfaces_with_its_reason():
-    """A green light over a dead bot is the worst available outcome."""
-    events = queue.Queue()
-    controller = BotController(
-        events,
-        bot_factory=lambda **kw: FakeBot(fail_with=RuntimeError("Improper token")),
-    )
-    controller.start(config=object(), advisor=object(), audit=object())
-    assert wait_for(controller, FAILED)
-    assert "Improper token" in controller.state.detail
-    kinds = [e.payload.state for e in drain(events) if e.kind == STATUS]
-    assert FAILED in kinds
-
-
-def test_state_changes_are_published():
-    events = queue.Queue()
-    controller = BotController(events, bot_factory=lambda **kw: FakeBot())
-    controller.start(config=object(), advisor=object(), audit=object())
-    assert wait_for(controller, RUNNING)
-    controller.stop()
-    states = [e.payload.state for e in drain(events) if e.kind == STATUS]
-    assert states[0] == "starting"
-    assert RUNNING in states
-    assert states[-1] == STOPPED
-
-
-def test_starting_twice_is_rejected():
-    events = queue.Queue()
-    controller = BotController(events, bot_factory=lambda **kw: FakeBot())
-    controller.start(config=object(), advisor=object(), audit=object())
-    assert wait_for(controller, RUNNING)
-    try:
-        with pytest.raises(RuntimeError, match="already running"):
-            controller.start(config=object(), advisor=object(), audit=object())
-    finally:
-        controller.stop()
-
-
-def test_stop_without_start_is_harmless():
-    controller = BotController(queue.Queue(), bot_factory=lambda **kw: FakeBot())
-    controller.stop()
-    assert controller.state.state == STOPPED
-
-
-def test_double_stop_without_start_publishes_nothing():
-    """stop() must only publish on an actual transition, not on every call."""
-    events = queue.Queue()
-    controller = BotController(events, bot_factory=lambda **kw: FakeBot())
+    # Stopping a controller that never started publishes nothing.
     controller.stop()
     controller.stop()
     assert controller.state.state == STOPPED
     assert drain(events) == []
 
-
-def test_running_is_published_only_after_readiness():
-    events = queue.Queue()
-    bot = FakeBot()
-    controller = BotController(events, bot_factory=lambda **kw: bot)
-    controller.start(config=object(), advisor=object(), audit=object())
+    controller.start(**START)
     try:
         assert wait_for(controller, RUNNING)
-        states = [e.payload.state for e in drain(events) if e.kind == STATUS]
-        assert RUNNING in states
+        assert bot.started is True
+        with pytest.raises(RuntimeError, match="already running"):
+            controller.start(**START)
     finally:
         controller.stop()
 
+    assert controller.state.state == STOPPED
+    states = states_in(events)
+    assert states[0] == "starting"
+    assert RUNNING in states
+    assert states[-1] == STOPPED
 
-def test_running_is_never_published_when_start_fails_before_ready():
+
+def test_a_failed_start_reports_why_never_reads_running_and_releases_the_bot():
+    """A green light over a dead bot is the worst available outcome. The
+    failed bot must still be closed: a real client holds an aiohttp session,
+    and fix-the-token-and-retry would otherwise leak one per attempt."""
     events = queue.Queue()
-    controller = BotController(
-        events,
-        bot_factory=lambda **kw: FakeBot(fail_with=RuntimeError("Improper token")),
-    )
-    controller.start(config=object(), advisor=object(), audit=object())
+    bot = FakeBot(fail_with=RuntimeError("Improper token"))
+    controller = BotController(events, bot_factory=lambda **kw: bot)
+    controller.start(**START)
     try:
         assert wait_for(controller, FAILED)
-        states = [e.payload.state for e in drain(events) if e.kind == STATUS]
+        assert "Improper token" in controller.state.detail
+        assert bot.closed is True
+        states = states_in(events)
+        assert FAILED in states
         assert RUNNING not in states
     finally:
         controller.stop()
 
-
-def test_factory_failure_settles_to_failed_and_stop_does_not_overwrite_it():
-    events = queue.Queue()
-
+    # A factory that cannot even build the bot settles the same way, and a
+    # later stop() must not paper over the failure with STOPPED.
     def bad_factory(**kwargs):
         raise RuntimeError("boom: bad factory")
 
-    controller = BotController(events, bot_factory=bad_factory)
-    controller.start(config=object(), advisor=object(), audit=object())
+    controller = BotController(queue.Queue(), bot_factory=bad_factory)
+    controller.start(**START)
     assert wait_for(controller, FAILED)
     assert "boom: bad factory" in controller.state.detail
     controller.stop()
     assert controller.state.state == FAILED
 
 
-def test_a_baseexception_after_running_settles_to_failed_not_running():
-    """CancelledError is a BaseException, not an Exception, on this Python
-    floor. A narrower except clause let the thread die while the settled
-    state still read RUNNING -- the worst available outcome, and
-    indistinguishable from a healthy bot to anything polling state.
-    """
-    events = queue.Queue()
-    controller = BotController(events, bot_factory=lambda **kw: DiesAfterReadyBot())
-    controller.start(config=object(), advisor=object(), audit=object())
+def test_a_bot_that_breaks_after_starting_never_leaves_running_standing():
+    """CancelledError is a BaseException, not an Exception: a narrower except
+    clause let the thread die while the settled state still read RUNNING."""
+    controller = BotController(queue.Queue(), bot_factory=lambda **kw: DiesAfterReadyBot())
+    controller.start(**START)
     try:
         assert wait_for(controller, FAILED)
-        # Prove the thread is actually dead, not merely that state briefly
-        # touched FAILED before bouncing back.
         thread = controller._thread
         assert thread is not None
         thread.join(timeout=2.0)
         assert not thread.is_alive()
         assert controller.state.state == FAILED
+    finally:
+        controller.stop()
+
+    # A readiness check that raises must neither publish RUNNING nor turn a
+    # clean stop() into a spurious FAILED.
+    events = queue.Queue()
+    controller = BotController(events, bot_factory=lambda **kw: BadReadinessBot())
+    controller.start(**START)
+    try:
+        time.sleep(0.05)  # the readiness check fails near-instantly
         assert controller.state.state != RUNNING
+        controller.stop()
+        assert controller.state.state == STOPPED
+        states = states_in(events)
+        assert RUNNING not in states
+        assert states[-1] == STOPPED
     finally:
         controller.stop()
 
@@ -283,18 +240,16 @@ def test_stop_timeout_leaves_thread_marked_and_refuses_restart():
     events = queue.Queue()
     bot = UnresponsiveBot()
     controller = BotController(events, bot_factory=lambda **kw: bot)
-    controller.start(config=object(), advisor=object(), audit=object())
+    controller.start(**START)
     try:
         assert wait_for(controller, RUNNING)
         controller.stop(timeout=0.1)
         assert controller.state.state == STOPPING
         with pytest.raises(RuntimeError, match="already running"):
-            controller.start(config=object(), advisor=object(), audit=object())
+            controller.start(**START)
     finally:
-        # Force the real shutdown so the test leaves no thread or loop
-        # running: schedule the close directly on the bot's own loop rather
-        # than through BotController.stop(), since UnresponsiveBot.close()
-        # deliberately does not unblock start() on its own.
+        # UnresponsiveBot.close() deliberately does not unblock start(), so
+        # schedule the close on the bot's own loop to leave no thread behind.
         loop = controller._loop
         if loop is not None and not loop.is_closed():
             loop.call_soon_threadsafe(bot._closed.set)
@@ -303,17 +258,13 @@ def test_stop_timeout_leaves_thread_marked_and_refuses_restart():
 
 
 def test_handles_are_cleared_before_the_drain_not_after():
-    """Regression for the window _shutdown_loop's own run_until_complete
-    reopens: _run must null self._loop/self._bot before it starts draining
-    the loop, not after -- otherwise a stop() landing during a slow drain
-    can see a "live" loop and schedule bot.close() onto it while it is
-    mid-teardown, recreating the exact freeze BotController.stop()'s
-    is_running()/is_closed() guard was added to eliminate.
-    """
+    """Regression: a stop() landing during _shutdown_loop's slow drain must
+    see no live loop, not schedule bot.close() onto one mid-teardown and
+    recreate the freeze the is_running()/is_closed() guard eliminated."""
     events = queue.Queue()
     bot = LingeringTaskBot(linger=0.3)
     controller = BotController(events, bot_factory=lambda **kw: bot)
-    controller.start(config=object(), advisor=object(), audit=object())
+    controller.start(**START)
     try:
         assert wait_for(controller, RUNNING)
 
@@ -322,21 +273,11 @@ def test_handles_are_cleared_before_the_drain_not_after():
         )
         stop_thread.start()
 
-        # Wait for the drain to actually begin (the lingering task observing
-        # its own cancellation) rather than guessing a sleep duration. At
-        # this instant the drain is in progress and will not return for
-        # another ~0.3s (LingeringTaskBot's linger).
+        # Wait for the drain to actually begin rather than guessing a sleep.
         assert bot.cancelled.wait(timeout=2.0)
-
-        # The handles must already be gone at this exact moment, not only
-        # after the (slow) drain finishes.
         assert controller._loop is None
         assert controller._bot is None
 
-        # A stop() landing right now must see nothing to close and go
-        # straight to joining, returning long before the drain's own delay
-        # elapses -- not burn the full timeout scheduling bot.close() onto a
-        # loop that is mid-teardown.
         start = time.monotonic()
         controller.stop(timeout=5.0)
         elapsed = time.monotonic() - start
@@ -349,126 +290,42 @@ def test_handles_are_cleared_before_the_drain_not_after():
     assert wait_for(controller, STOPPED)
 
 
-def test_readiness_failure_does_not_publish_running_or_corrupt_a_clean_stop():
-    events = queue.Queue()
-    controller = BotController(events, bot_factory=lambda **kw: BadReadinessBot())
-    controller.start(config=object(), advisor=object(), audit=object())
-    try:
-        # Give the background thread a moment to run past the readiness
-        # check (which fails near-instantly); state must never become
-        # RUNNING off the back of it.
-        time.sleep(0.05)
-        assert controller.state.state != RUNNING
-        controller.stop()
-        assert controller.state.state == STOPPED
-        states = [e.payload.state for e in drain(events) if e.kind == STATUS]
-        assert RUNNING not in states
-        assert states[-1] == STOPPED
-    finally:
-        controller.stop()
+def test_a_running_bot_takes_live_settings_and_can_publish_back_to_the_gui():
+    """HITL and the denial wording change mid-exercise without a restart;
+    the bot reaches the GUI queue only through the two callbacks it is given."""
+    from rangecontrol.gui.events import ERROR, PENDING
 
-
-def test_a_failed_start_still_closes_the_bot():
-    """Nothing calls bot.close() when the bot dies on its own: stop() only
-    ever runs for a controller a caller is actively shutting down, and a
-    bot that fails during start() (a rejected token, say) is never handed
-    to stop() at all. A real discord.py client holds an aiohttp session and
-    connector that only close() releases, and the GUI's own recovery path --
-    fix the token, click Start again -- guarantees every failed attempt
-    leaks one without this.
-    """
-    events = queue.Queue()
-    bot = FakeBot(fail_with=RuntimeError("Improper token"))
-    controller = BotController(events, bot_factory=lambda **kw: bot)
-    controller.start(config=object(), advisor=object(), audit=object())
-    try:
-        assert wait_for(controller, FAILED)
-        assert bot.closed is True
-    finally:
-        controller.stop()
-
-
-# -- set_human_in_the_loop: the live toggle -----------------------------------
-
-
-def test_set_human_in_the_loop_updates_the_live_bots_mode():
     events = queue.Queue()
     bot = FakeBot()
-    controller = BotController(events, bot_factory=lambda **kw: bot)
-    controller.start(config=object(), advisor=object(), audit=object())
+    captured = {}
+
+    def factory(**kwargs):
+        captured.update(kwargs)
+        return bot
+
+    controller = BotController(events, bot_factory=factory)
+    # No bot yet: both live setters are harmless no-ops.
+    controller.set_human_in_the_loop(True)
+    controller.set_denied_text("Nope.")
+    assert controller.state.state == STOPPED
+
+    controller.start(**START)
     try:
         assert wait_for(controller, RUNNING)
         controller.set_human_in_the_loop(True)
         assert bot.mode.enabled is True
         controller.set_human_in_the_loop(False)
         assert bot.mode.enabled is False
-    finally:
-        controller.stop()
-
-
-def test_set_human_in_the_loop_is_a_harmless_no_op_before_any_bot_exists():
-    controller = BotController(queue.Queue(), bot_factory=lambda **kw: FakeBot())
-    controller.set_human_in_the_loop(True)  # must not raise
-    assert controller.state.state == STOPPED
-
-
-# -- I1/I2: the bot factory must receive live pending/error callbacks -------
-
-
-def test_bot_factory_receives_pending_and_error_callbacks():
-    """RangeControlBot needs a way to publish onto the GUI's event queue
-    without importing gui.events itself -- these two callbacks are it.
-    Calling them directly here (off the bot thread) proves the wiring
-    without needing a real RangeControlBot or PendingRegistry."""
-    from rangecontrol.gui.events import ERROR, PENDING
-
-    events = queue.Queue()
-    captured = {}
-
-    def factory(**kwargs):
-        captured.update(kwargs)
-        return FakeBot()
-
-    controller = BotController(events, bot_factory=factory)
-    controller.start(config=object(), advisor=object(), audit=object())
-    try:
-        assert wait_for(controller, RUNNING)
-    finally:
-        controller.stop()
-
-    assert callable(captured.get("on_pending_change"))
-    assert callable(captured.get("on_error"))
-
-    captured["on_pending_change"](2)
-    captured["on_error"]("white cell unreachable")
-
-    kinds = [(e.kind, e.payload) for e in drain(events)]
-    assert (PENDING, 2) in kinds
-    assert (ERROR, "white cell unreachable") in kinds
-
-
-def test_set_human_in_the_loop_is_a_harmless_no_op_after_stop():
-    events = queue.Queue()
-    controller = BotController(events, bot_factory=lambda **kw: FakeBot())
-    controller.start(config=object(), advisor=object(), audit=object())
-    assert wait_for(controller, RUNNING)
-    controller.stop()
-    controller.set_human_in_the_loop(True)  # must not raise: no bot to reach
-
-
-def test_set_denied_text_updates_the_live_bot():
-    events = queue.Queue()
-    bot = FakeBot()
-    controller = BotController(events, bot_factory=lambda **kwargs: bot)
-    controller.start(config=object(), advisor=object(), audit=object())
-    try:
-        wait_for(controller, RUNNING)
         controller.set_denied_text("Nope.")
         assert bot.denied_text == "Nope."
     finally:
         controller.stop()
 
+    controller.set_human_in_the_loop(True)  # after stop: no bot to reach
+    assert bot.mode.enabled is False
 
-def test_set_denied_text_is_a_harmless_no_op_before_any_bot_exists():
-    controller = BotController(queue.Queue())
-    controller.set_denied_text("Nope.")  # must not raise
+    captured["on_pending_change"](2)
+    captured["on_error"]("white cell unreachable")
+    kinds = [(e.kind, e.payload) for e in drain(events)]
+    assert (PENDING, 2) in kinds
+    assert (ERROR, "white cell unreachable") in kinds
