@@ -8,7 +8,7 @@ import discord
 
 from rangecontrol.advisor.engine import Advisor
 from rangecontrol.advisor.models import Advice, GateVerdict
-from rangecontrol.advisor.prompts import ERROR_TEXT
+from rangecontrol.advisor.prompts import ERROR_TEXT, SCREENED_DENIALS
 from rangecontrol.audit.log import AuditLog
 from rangecontrol.bot.diagnostics import WHITE_CELL_PERMISSIONS
 from rangecontrol.bot.client import (
@@ -22,7 +22,7 @@ from rangecontrol.bot.mode import ModeSwitch
 from rangecontrol.bot.pending import PendingRegistry
 from rangecontrol.bot.ratelimit import RateLimiter
 from rangecontrol.config import DEFAULT_HITL_DENIED_TEXT, load_config
-from rangecontrol.llm.base import LLMError
+from rangecontrol.llm.base import LLMError, UsageLimitError
 from tests.support.stub_provider import StubProvider
 
 BASE_ENV = {
@@ -243,6 +243,28 @@ async def test_provider_failure_yields_the_error_text(tmp_path):
     )
     bot = FakeBot(advisor, AuditLog(tmp_path), RateLimiter(100, 60))
     assert await ask(bot) == ERROR_TEXT
+
+
+async def test_a_usage_limit_is_denied_at_once_and_the_operator_is_told(tmp_path):
+    """With human in the loop on, a limit denial is still sent straight away:
+    there is no ruling for the white cell to release, and holding it would
+    leave the asker waiting on a review that cannot change anything. The
+    status bar says why every request is being denied."""
+    advisor = Advisor(
+        provider=StubProvider(),
+        gate_provider=StubProvider(error=UsageLimitError("usage limits reached")),
+        range_md="r",
+        corpus_text="c",
+    )
+    bot = FakeBot(advisor, AuditLog(tmp_path), RateLimiter(100, 60))
+    bot.mode.set(True)
+    reply = await ask(bot)
+    assert reply in SCREENED_DENIALS
+    assert len(bot.pending) == 0
+    (record,) = audit_records(bot)
+    assert record["kind"] == "limit_denied"
+    assert "held" not in record
+    assert any("usage limit" in error for error in bot.errors), bot.errors
 
 
 async def test_advise_runs_off_the_event_loop_thread(tmp_path):

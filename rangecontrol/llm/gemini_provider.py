@@ -6,7 +6,7 @@ import hashlib
 import logging
 import threading
 
-from rangecontrol.llm.base import LLMError, brief_error
+from rangecontrol.llm.base import LLMError, UsageLimitError, brief_error, is_usage_limit
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +212,12 @@ class GeminiProvider:
                 model=self._model, contents=contents, config=config
             )
         except Exception as exc:  # noqa: BLE001 - deliberately wrap every SDK failure
+            if is_usage_limit(exc):
+                # Not _RequestFailed: a limit is not a stale cache handle, and
+                # retrying inline would only spend another refused call.
+                raise UsageLimitError(
+                    f"Gemini request failed: {brief_error(exc)}"
+                ) from exc
             raise _RequestFailed(
                 f"Gemini request failed: {brief_error(exc)}"
             ) from exc

@@ -66,7 +66,10 @@ ingest report.
 
 Click **Refresh Resources**, then **Generate**. This reads everything through
 the AI and writes `Range.md`. It takes a few minutes and costs API calls.
-Review it before going live. You can edit it by hand.
+Review it before going live. You can edit it by hand. Keep **Standing
+Adjudication Rules** to rules that protect the range: if the blue team's
+in-character paperwork (an MOU, change-request forms, a declared freeze)
+lands there, the bot is the change board it points at and denies everything.
 
 ## 5. Start the bot
 

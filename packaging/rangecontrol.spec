@@ -7,7 +7,8 @@
 from PyInstaller.utils.hooks import collect_all
 
 datas = [("../rangecontrol/RangeTemplate.md", "rangecontrol"),
-         ("../rangecontrol/PREGENERATE.md", "rangecontrol")]
+         ("../rangecontrol/PREGENERATE.md", "rangecontrol"),
+         ("../rangecontrol/english_words.txt.gz", "rangecontrol")]
 binaries = []
 hiddenimports = []
 

@@ -11,7 +11,7 @@ import logging
 import random
 
 from rangecontrol.advisor.gate import classify
-from rangecontrol.advisor.models import Advice, GateVerdict, Ruling
+from rangecontrol.advisor.models import LIMIT_DENIED, Advice, GateResult, GateVerdict, Ruling
 from rangecontrol.advisor.prompts import (
     CLARIFY_TEXT,
     DEFLECTION_TEXT,
@@ -26,7 +26,7 @@ from rangecontrol.advisor.screen import (
     range_vocabulary,
     review_reply,
 )
-from rangecontrol.llm.base import Provider
+from rangecontrol.llm.base import Provider, UsageLimitError
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +60,8 @@ class Advisor:
 
         try:
             gate = classify(question, self._gate_provider)
+        except UsageLimitError as exc:
+            return self._limit_denied(exc)
         except Exception as exc:  # noqa: BLE001 - fail closed on anything
             logger.exception("intent gate failed")
             return Advice(kind="error", public_text=ERROR_TEXT, error=repr(exc))
@@ -80,6 +82,8 @@ class Advisor:
 
         try:
             ruling = adjudicate(question, self._context, self._provider)
+        except UsageLimitError as exc:
+            return self._limit_denied(exc, gate)
         except Exception as exc:  # noqa: BLE001 - fail closed on anything
             logger.exception("ruling failed")
             return Advice(
@@ -99,6 +103,22 @@ class Advisor:
             ruling=ruling,
             gate=gate,
             screen_reason=screen_reason,
+        )
+
+    def _limit_denied(self, exc: UsageLimitError, gate: GateResult | None = None) -> Advice:
+        """Deny outright: the provider is at a usage limit and cannot rule.
+
+        A denial, never an approval, so the range stays safe while no model
+        is available. Drawn from the same pool as any denial, so the blue
+        team cannot tell an outage from a ruling; the provider's message,
+        which says when access returns, goes to the white cell.
+        """
+        logger.warning("provider at its usage limit; denying: %s", exc)
+        return Advice(
+            kind=LIMIT_DENIED,
+            public_text=fallback_reply("DENIED", self._rng),
+            gate=gate,
+            error=repr(exc),
         )
 
     def _screen(self, question: str, ruling: Ruling) -> str:

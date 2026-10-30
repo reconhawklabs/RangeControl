@@ -8,7 +8,7 @@ from rangecontrol.advisor.prompts import (
     SCREENED_APPROVALS,
     SCREENED_DENIALS,
 )
-from rangecontrol.llm.base import LLMError
+from rangecontrol.llm.base import LLMError, UsageLimitError
 from tests.support.stub_provider import StubProvider
 
 RANGE_MD = "## Protected Dependency Index\n| DC-VULCAN | host | unreachable | MSEL-01 |"
@@ -95,6 +95,28 @@ def test_ruling_failure_or_garbage_fails_closed_not_approved():
         assert advice.kind == "error"
         assert advice.public_text == ERROR_TEXT
         assert advice.ruling is None
+
+
+def test_a_usage_limit_denies_instead_of_erroring():
+    """2026-10-29: the spend limit was reached and every question got "take it
+    to range control". A limit at either stage is now a denial, drawn from the
+    same pool as any other so it reads like one, with the provider's message
+    kept for the white cell. It is never an approval."""
+    limit = UsageLimitError("You have reached your specified API usage limits.")
+    for gate_error, ruling_error in ((limit, None), (None, limit)):
+        advisor, _, ruling = build(
+            [] if gate_error else [gate_reply(GateVerdict.CHANGE_REQUEST)],
+            [],
+            gate_error=gate_error,
+            ruling_error=ruling_error,
+        )
+        advice = advisor.advise("block 1.2.3.4")
+        assert advice.kind == "limit_denied"
+        assert advice.public_text in SCREENED_DENIALS
+        assert "usage limits" in advice.error
+        assert advice.ruling is None
+        if gate_error:
+            assert ruling.calls == []
 
 
 def test_context_is_built_once_and_reused():

@@ -7,7 +7,7 @@ from rangecontrol.range_doc.generator import (
     generate_range_md,
     write_range_md,
 )
-from rangecontrol.range_doc.loader import REQUIRED_SECTIONS
+from rangecontrol.range_doc.loader import REQUIRED_SECTIONS, load_template
 from tests.support.stub_provider import StubProvider
 
 COMPLETE = "\n".join(f"## {name}\n\ncontent\n" for name in REQUIRED_SECTIONS)
@@ -46,6 +46,15 @@ def test_prompt_forbids_inventing_facts():
     # Rule 5: contradictions between sources are recorded, never silently
     # resolved by picking one reading.
     assert "contradict" in lowered
+    # Rule 6: the 2026-10-27 run. A go book's MOU and change-request rules
+    # were transcribed as standing denials, and the bot enforced them against
+    # requests that touched nothing. In-character process is context, never
+    # a standing rule, and an inject that only imposes one depends on nothing.
+    assert "in-character" in lowered
+    assert "never as a standing" in lowered
+    template = load_template().lower()
+    section = template.split("## standing adjudication rules")[1].split("##")[0]
+    assert "in-character" in section
 
 
 def test_generation_fails_loudly_rather_than_returning_a_partial_document():

@@ -17,7 +17,7 @@ import discord
 from discord import app_commands
 
 from rangecontrol.advisor.engine import Advisor
-from rangecontrol.advisor.models import Advice
+from rangecontrol.advisor.models import LIMIT_DENIED, Advice
 from rangecontrol.audit.log import AuditLog
 from rangecontrol.bot.diagnostics import (
     ALLOWED_CHANNEL_PERMISSIONS,
@@ -42,7 +42,8 @@ APPROVE_EMOJI = "✅"
 DENY_EMOJI = "❌"
 
 HELD_TEXT = (
-    "Logged with the change board — I'll come back to you on this one shortly."
+    "Logged with the change board. I'll come back to you shortly with whether "
+    "you're cleared; hold off before you make the change."
 )
 
 # The built-in denial wording. The live value is ``bot.denied_text``: fixed
@@ -200,6 +201,14 @@ async def handle_question(
         latency_ms=latency_ms,
         held=held,
     )
+
+    if advice.kind == LIMIT_DENIED:
+        # Every request is being denied until the limit lifts; the operator
+        # must not have to find that out from the white cell channel.
+        bot.report_error(
+            f"AI provider usage limit reached: denying every request until "
+            f"access returns. {advice.error or ''}"
+        )
 
     if should_hold:
         if held:

@@ -21,9 +21,14 @@ sent in its place. The white cell still sees the original.
 from __future__ import annotations
 
 import functools
+import gzip
 import json
+import logging
 import random
 import re
+import zlib
+from collections.abc import Iterable
+from importlib import resources
 
 from rangecontrol.advisor.gate import parse_json_object
 from rangecontrol.advisor.prompts import (
@@ -35,6 +40,10 @@ from rangecontrol.advisor.prompts import (
 from rangecontrol.llm.base import EFFORT_MEDIUM, LLMError, Provider
 from rangecontrol.range_doc.loader import load_template
 
+logger = logging.getLogger(__name__)
+
+# Package data built by scripts/build_english_words.py from the Moby word list.
+WORDS_FILENAME = "english_words.txt.gz"
 # Same reasoning as GATE_MAX_TOKENS: the cap covers thinking plus the reply,
 # and a truncation here would withhold every ruling's text.
 REVIEW_MAX_TOKENS = 4000
@@ -167,6 +176,26 @@ _GENERIC_TERMS = frozenset(
     """.split()
 )
 
+# The words the ruling prompt tells a reply to use: the decision, a mundane
+# process reason, a general caution. A range that happens to contain one
+# ("Network Owner", WAIT_TIME, a heading) must not make every reply that says
+# "until the owner signs off" or "it will have to wait" a disclosure. Listed
+# rather than read from the prompt, so that editing the prompt cannot quietly
+# exempt a word that names something on a range.
+_REPLY_WORDS = frozenset(
+    """
+    a all an and any are as at be been before but by can cannot change changes
+    closes current cycle do does done for freeze from go had has have held hold
+    holding if in is it its it's needs next no not now of off on once one open
+    or owner owners pending please previous process ready record recorded
+    reopens request requests resubmit review reviewed right schedule
+    scheduled sign sign-off signed signs so that the then this time to until
+    up wait was we will window with would yet you your
+    action actions approval approve approved apply applied deny denied
+    maintenance contract contractual commitment
+    """.split()
+)
+
 # Invisible characters and defanging ("10.77.0[.]10") that would otherwise
 # split a term or an address in two without changing what the reader sees.
 _ZERO_WIDTH = re.compile("[​‌‍⁠﻿­]")
@@ -241,24 +270,130 @@ def _terms(text: str) -> set[str]:
 
 
 @functools.lru_cache(maxsize=1)
-def _template_words() -> frozenset[str]:
-    """Every word of the shipped range template: structure, not range data."""
+def _structure_words() -> frozenset[str]:
+    """Words every range shares: structure, not range data.
+
+    The shipped template, the canned replies (no fallback may ever fail its
+    own screen), and the words a reply is told to use.
+    """
+    texts = [*SCREENED_APPROVALS, *SCREENED_DENIALS]
     try:
-        template = load_template()
+        texts.append(load_template())
     except FileNotFoundError:
-        return frozenset()
-    words = {w.lower() for w in _WORD.findall(template)}
-    return frozenset(words | _terms(template))
+        pass
+    words: set[str] = set(_REPLY_WORDS)
+    for text in texts:
+        words |= {w.lower() for w in _WORD.findall(text)} | _terms(text)
+    return frozenset(words)
+
+
+_EDGE_PUNCTUATION = ".,;:!?()[]{}\"'"
+
+
+def _prose_words(text: str) -> set[str]:
+    """Lowercase words used in running prose: a lowercase word on each side.
+
+    "the time of each action" is prose. "hades IN A 10.1.1.5", "ssh to atlas"
+    at a line's end, and "mercury listens on 25" at a line's start are not:
+    that is how commands, zone files, and tables write a name in lowercase.
+    """
+    found: set[str] = set()
+    for line in text.splitlines():
+        words = [token.strip(_EDGE_PUNCTUATION) for token in line.split()]
+        for before, word, after in zip(words, words[1:], words[2:]):
+            if all(w.isalpha() and w.islower() for w in (before, word, after)):
+                found.add(word)
+    return found
+
+
+def _capitals(text: str) -> set[str]:
+    """Standalone words set in capitals, lowercased: how a heading is set."""
+    return {token.lower() for token in _TOKEN.findall(text) if token.isalpha() and token.isupper()}
+
+
+def _component_parts(text: str) -> set[str]:
+    """Identifier-shaped parts of compound tokens: "atlas" of DC-ATLAS.
+
+    A heading word is never produced this way, so a part is always a name.
+    """
+    return {
+        part.lower()
+        for token in _TOKEN.findall(text)
+        if _SEPARATORS.search(token)
+        for part in _SEPARATORS.split(token)
+        if _identifier_like(part)
+    }
+
+
+class WordListError(Exception):
+    """The bundled English word list is missing, corrupt, or empty."""
+
+
+def _read_word_list() -> bytes:
+    return resources.files("rangecontrol").joinpath(WORDS_FILENAME).read_bytes()
+
+
+def english_words(candidates: Iterable[str]) -> set[str]:
+    """Those of ``candidates`` that are English words.
+
+    Raises WordListError when the bundled list cannot be used, whatever the
+    reason. Read on each call and not kept: the vocabulary is built once per
+    bot start, and the whole list held in memory would cost tens of
+    megabytes for nothing.
+    """
+    wanted = set(candidates)
+    try:
+        words = gzip.decompress(_read_word_list()).decode("ascii").split()
+    except (OSError, EOFError, ValueError, zlib.error, ModuleNotFoundError) as exc:
+        # OSError covers a missing file and a bad gzip header; EOFError a
+        # truncated one; ValueError (UnicodeDecodeError) anything non-ASCII.
+        raise WordListError(f"{WORDS_FILENAME} is unusable: {exc!r}") from exc
+    if not words:
+        raise WordListError(f"{WORDS_FILENAME} is empty")
+    return {word for word in words if word in wanted}
+
+
+def _headings(candidates: set[str]) -> set[str]:
+    """English words among ``candidates``, or none when the list is unusable.
+
+    Unusable, nothing is treated as a heading, so the screen withholds more
+    replies, never fewer, and the bot still starts.
+    """
+    if not candidates:
+        return set()
+    try:
+        return english_words(candidates)
+    except WordListError as exc:
+        logger.warning("%s; capitalised headings stay range terms", exc)
+        return set()
 
 
 def range_vocabulary(*texts: str) -> frozenset[str]:
-    """Every range-specific term in the range material, built once."""
+    """Every range-specific term in the range material, built once.
+
+    A term is a heading word, not a name, only when all of these hold: the
+    material sets it alone in capitals, also uses it in running lowercase
+    prose, it is an English word, and the material never marks it as a name
+    (backticks, a proper noun, or part of a compound like DC-ATLAS). That is
+    how a go book sets "CHANGE REQUEST FORM" or "RIGHT". Without the rule its
+    headings put hundreds of English words in the vocabulary and nearly every
+    reply was withheld; with any condition missing, a real name written in
+    lowercase somewhere ("psexec", "hades IN A", "ssh to atlas") goes free.
+    """
     vocabulary: set[str] = set()
+    names: set[str] = set()
+    capitals: set[str] = set()
+    prose: set[str] = set()
     for text in texts:
         cleaned = _clean(text)
-        vocabulary |= _terms(cleaned)
-        vocabulary |= {word.lower() for word in _proper_nouns(cleaned)}
-    return frozenset(vocabulary - _template_words() - _GENERIC_TERMS)
+        proper = {word.lower() for word in _proper_nouns(cleaned)}
+        vocabulary |= _terms(cleaned) | proper
+        names |= proper | _component_parts(cleaned)
+        names |= {span.strip().lower() for span in _BACKTICKED.findall(cleaned)}
+        capitals |= _capitals(cleaned)
+        prose |= _prose_words(cleaned)
+    headings = _headings((vocabulary & capitals & prose) - names)
+    return frozenset(vocabulary - headings - _structure_words() - _GENERIC_TERMS)
 
 
 def _words_of(text: str) -> set[str]:

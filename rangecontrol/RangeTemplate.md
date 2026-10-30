@@ -79,7 +79,15 @@ Assets and systems participants must not modify, regardless of any other rule.
 ## Standing Adjudication Rules
 
 Designer-authored blanket approvals and denials, applied before any case-by-case
-reasoning.
+reasoning. Only rules that protect the range itself belong here: what must not
+be touched because changing it would break an event, a path, a check, or the
+range's own infrastructure.
+
+The defending team's in-character process is not a standing rule: contracts,
+memoranda, change-management policy, request forms, approval chains, and
+freezes an event declares. The adjudicator is the change board those rules
+point at, so as rules they would deny every request. Record them under
+Exercise Overview as context.
 
 - **Always approve:**
 - **Always deny:**

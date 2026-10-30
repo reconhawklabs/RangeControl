@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from rangecontrol.advisor.models import Advice
+from rangecontrol.advisor.models import LIMIT_DENIED, Advice
 
 if TYPE_CHECKING:  # pragma: no cover - import only for the return annotation
     import discord
@@ -43,6 +43,14 @@ _NOT_HELD_TEXT = (
     "Human in the loop is on, but only rulings are held for approval. This "
     "was a {kind}, which carries no adjudication to review, so it went to "
     "the blue team immediately."
+)
+
+
+_LIMIT_TEXT = (
+    "The AI provider's usage limit is reached, so no ruling was made and the "
+    "request was denied. Every request is denied until access returns; the "
+    "Error field below says when. Raising the limit in the provider's console "
+    "restores rulings at once."
 )
 
 
@@ -83,6 +91,9 @@ def embed_fields(
                 ),
             ]
         )
+    elif advice.kind == LIMIT_DENIED:
+        fields.append(("Outcome", advice.kind, True))
+        fields.append(("Denied automatically", _LIMIT_TEXT, False))
     else:
         fields.append(("Outcome", advice.kind, True))
 
@@ -125,6 +136,8 @@ def embed_fields(
 def _colour(advice: Advice) -> int:
     if advice.kind == "error":
         return _ERROR_COLOUR
+    if advice.kind == LIMIT_DENIED:
+        return _COLOURS["DENIED"]
     if advice.ruling is not None:
         return _COLOURS.get(advice.ruling.verdict, _NEUTRAL_COLOUR)
     return _NEUTRAL_COLOUR

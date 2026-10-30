@@ -13,6 +13,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from rangecontrol.advisor.engine import Advisor
+from rangecontrol.advisor.screen import WORDS_FILENAME, WordListError, english_words
 from rangecontrol.audit.log import AuditLog
 from rangecontrol.config import (
     Config,
@@ -379,6 +380,19 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
         print("OK: RangeTemplate.md loaded from the bundle.")
+
+        # Without it the reply screen still runs, but treats a go book's
+        # capitalised headings as range names and withholds nearly every
+        # reply, as it did on 2026-10-27. Silent in use, so caught here.
+        try:
+            found = english_words({"change", "request"})
+        except WordListError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        if found != {"change", "request"}:
+            print(f"Error: {WORDS_FILENAME} is missing common words.", file=sys.stderr)
+            return 1
+        print(f"OK: {WORDS_FILENAME} loaded from the bundle.")
 
         # Importing the GUI module exercises the Tk import and every hidden
         # import rangecontrol.spec collects for it, without opening a window

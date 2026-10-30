@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import logging
 
-from rangecontrol.llm.base import LLMError, brief_error
+from rangecontrol.llm.base import LLMError, UsageLimitError, brief_error, is_usage_limit
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +134,8 @@ class AnthropicProvider:
             if not self._fallbacks_unsupported and _rejects_fallbacks(exc):
                 self._fallbacks_unsupported = True
                 return self._send(kwargs)
-            raise LLMError(f"Anthropic request failed: {brief_error(exc)}") from exc
+            error = UsageLimitError if is_usage_limit(exc) else LLMError
+            raise error(f"Anthropic request failed: {brief_error(exc)}") from exc
         _log_fallback(response, kwargs.get("model"))
 
         # Response parsing sits inside the boundary too: base.Provider promises

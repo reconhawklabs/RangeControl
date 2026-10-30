@@ -5,11 +5,41 @@ No provider-specific import may appear outside this package.
 
 from __future__ import annotations
 
+import re
 from typing import Protocol, runtime_checkable
 
 
 class LLMError(Exception):
     """Any failure reaching or parsing a response from an LLM provider."""
+
+
+class UsageLimitError(LLMError):
+    """The provider refused because the account hit a usage, spend, rate, or
+    quota limit. Retrying now will not help; access returns on its own or when
+    the limit is raised."""
+
+
+# How the vendors word a limit: Anthropic's workspace spend limit ("You have
+# reached your specified API usage limits", a 400), its billing refusal
+# ("credit balance is too low"), rate limits, and Gemini's RESOURCE_EXHAUSTED.
+_LIMIT_MESSAGE = re.compile(
+    r"usage limit|spend(?:ing)? limit|credit balance|rate.?limit|quota|"
+    r"resource.?exhausted",
+    re.IGNORECASE,
+)
+
+
+def is_usage_limit(exc: BaseException) -> bool:
+    """Whether an SDK failure means the account is at a usage limit.
+
+    HTTP 429 always is. Anthropic reports a spend limit as a 400, so the
+    message decides there.
+    """
+    status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    if status == 429:
+        return True
+    message = str(getattr(exc, "message", None) or exc or "")
+    return bool(_LIMIT_MESSAGE.search(message))
 
 
 _BRIEF_LIMIT = 300

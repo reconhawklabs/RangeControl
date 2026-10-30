@@ -128,6 +128,16 @@ template in. Three sections carry the most weight:
   table. This is what makes adjudication a lookup rather than a re-derivation
   of the whole scenario, so do not leave it thin.
 
+Keep **Standing Adjudication Rules** and **Out of Scope / Do Not Touch** to
+rules that protect the range itself. The defending team's in-character
+process (contracts, memoranda of understanding, change-management policy,
+request forms, approval chains, change freezes an inject declares, lists of
+actions their role may not take) goes under **Exercise Overview** as
+context. The bot is the change board those rules point at, so listed as
+standing denials they make it refuse every request, including ones that
+touch nothing. An inject that only imposes or tests a process depends on no
+host, address, or account; its **Breaks if** is N/A.
+
 Record anything you could not determine under **Ingest Gaps** rather than
 guessing. A stated gap is safe; an invented fact produces wrong rulings.
 

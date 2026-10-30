@@ -44,6 +44,15 @@ Rules:
    whole scenario, so populate it thoroughly.
 5. Where sources contradict each other, record both readings under "Ingest Gaps"
    rather than silently choosing one.
+6. Keep the range's integrity apart from the storyline's process. Contracts,
+   memoranda of understanding, change-management policy, request forms,
+   approval chains, change freezes, and lists of actions the defending team
+   may not take without authorization are in-character process. Record them
+   under "Exercise Overview" as context, never as a standing rule in "Standing
+   Adjudication Rules" or "Out of Scope / Do Not Touch". The adjudicator is
+   the change board they point at, so as rules they would deny every request.
+   An inject that only imposes or tests a process depends on no host, address,
+   or account; its "Breaks if" is N/A.
 
 Output the Markdown document and nothing else. No preamble, no commentary.
 """

@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from rangecontrol.llm.base import LLMError, Provider
+from rangecontrol.llm.base import LLMError, Provider, UsageLimitError
 from rangecontrol.llm.gemini_provider import GeminiProvider
 
 
@@ -243,6 +243,27 @@ def test_an_expired_cache_is_retried_inline_but_model_failures_are_not():
     models = TruncatedModels()
     provider, _, _ = build_caching(models=models)
     with pytest.raises(LLMError, match="truncated"):
+        provider.complete(system=BIG_SYSTEM, user="u")
+    assert models.count == 1
+
+
+def test_a_quota_limit_raises_usage_limit_and_is_not_retried_inline():
+    """Gemini reports an exhausted quota as 429 RESOURCE_EXHAUSTED. That is a
+    limit, not a stale cache, so retrying without the cache only spends
+    another failed call."""
+    error = Exception("429 RESOURCE_EXHAUSTED. Quota exceeded for metric")
+    error.code = 429
+
+    class Models:
+        count = 0
+
+        def generate_content(self, **kwargs):
+            self.count += 1
+            raise error
+
+    models = Models()
+    provider, _, _ = build_caching(models=models)
+    with pytest.raises(UsageLimitError, match="Gemini request failed"):
         provider.complete(system=BIG_SYSTEM, user="u")
     assert models.count == 1
 

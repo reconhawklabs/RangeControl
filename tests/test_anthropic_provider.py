@@ -1,7 +1,7 @@
 import pytest
 
 from rangecontrol.llm.anthropic_provider import STREAM_THRESHOLD, AnthropicProvider
-from rangecontrol.llm.base import LLMError, Provider
+from rangecontrol.llm.base import LLMError, Provider, UsageLimitError
 
 
 class FakeStream:
@@ -135,6 +135,34 @@ def test_sdk_failures_are_wrapped_with_the_sdk_message_on_both_paths():
         provider, _ = build(error=TooLong(TooLong.message))
         with pytest.raises(LLMError, match="prompt is too long"):
             provider.complete(system="s", user="u", max_tokens=max_tokens)
+
+
+def test_a_usage_limit_is_told_apart_from_other_failures():
+    """2026-10-29: the workspace spend limit returned a 400 and every question
+    got "take it to range control" for days. A limit has its own error type so
+    the bot can deny instead; anything else stays an ordinary failure."""
+
+    def sdk_error(status, message):
+        error = Exception(message)
+        error.status_code = status
+        error.message = message
+        return error
+
+    limits = (
+        sdk_error(400, "You have reached your specified API usage limits. You "
+                  "will regain access on 2026-11-01 at 00:00 UTC."),
+        sdk_error(400, "Your credit balance is too low to access the Anthropic API."),
+        sdk_error(429, "Number of request tokens has exceeded your per-minute rate limit"),
+    )
+    for error in limits:
+        provider, _ = build(error=error)
+        with pytest.raises(UsageLimitError, match="Anthropic request failed"):
+            provider.complete(system="s", user="u")
+
+    provider, _ = build(error=sdk_error(400, "prompt is too long: 250000 tokens"))
+    with pytest.raises(LLMError) as raised:
+        provider.complete(system="s", user="u")
+    assert not isinstance(raised.value, UsageLimitError)
 
 
 def test_large_budgets_stream_and_small_ones_do_not():

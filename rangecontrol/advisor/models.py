@@ -61,11 +61,18 @@ class Ruling:
     confidence: str  # "high" | "medium" | "low"
 
 
+# The provider was at a usage limit, so the request was denied without a
+# ruling. Sent at once even with human in the loop on: there is nothing to
+# release, and a review could not change the answer.
+LIMIT_DENIED = "limit_denied"
+
+
 @dataclass(frozen=True)
 class Advice:
     """The complete outcome of one question.
 
-    ``kind`` is one of "ruling", "deflection", "clarify", or "error".
+    ``kind`` is one of "ruling", "deflection", "clarify", "error", or
+    LIMIT_DENIED.
     ``public_text`` is always safe to send to the blue team.
 
     ``screen_reason`` is set when the ruling model's own reply failed the

@@ -35,7 +35,7 @@ rangecontrol = "rangecontrol.main:main"
 include = ["rangecontrol*"]
 
 [tool.setuptools.package-data]
-rangecontrol = ["RangeTemplate.md", "PREGENERATE.md"]
+rangecontrol = ["RangeTemplate.md", "PREGENERATE.md", "english_words.txt.gz"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

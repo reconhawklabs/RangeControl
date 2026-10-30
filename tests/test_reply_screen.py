@@ -40,6 +40,59 @@ RANGE_MD = (
 )
 VOCAB = range_vocabulary(RANGE_MD)
 
+# Shaped like the go books and slide decks of a real range: headings in
+# capitals over prose that uses the same words in lowercase, and the names
+# that actually matter scattered through it.
+CAPS_RANGE_MD = (
+    "CHANGE REQUEST FORM. ALL FIELDS REQUIRED.\n"
+    "| ACTION | OWNER | TIME | RIGHT | APPROVED | LOGGED |\n"
+    "The network owner records the time of each action and must give sign-off "
+    "before any change request is closed. All actions are logged right away, "
+    "and every request to apply a change is reviewed.\n"
+    "DC-VULCAN answers LDAP. WS01 is the analyst workstation. "
+    "svc-vulcan-backup runs nightly. VULCAN is the staging tag.\n"
+    "LATERAL MOVEMENT: run psexec from the foothold, then join wheartland as "
+    "WHEARTLAND\\user. PsExec is logged.\n"
+    "| DC-ATLAS | 10.77.0.11 | domain controller |\n"
+    "first ssh to atlas then check the logs.\n"
+    "HADES is the file server.\n"
+    "hades IN A 10.77.0.12\n"
+)
+CAPS_VOCAB = range_vocabulary(CAPS_RANGE_MD)
+
+# Drafts the ruling model wrote on 2026-10-27, each withheld for naming "a
+# range term the asker did not" when the terms were "right", "time", "all",
+# "request", "action", "owner", and "sign-off". 24 of 25 rulings that day
+# reached the blue team as a canned fallback instead of what the model wrote.
+OCTOBER_DRAFTS = (
+    (
+        "We are requesting that the user account helena.smith be disabled.",
+        "No. Account changes of this kind are on hold until the current review "
+        "cycle closes and the required sign-off has been recorded, so I can't "
+        "action a disablement right now.",
+    ),
+    (
+        "We are requesting that Diana Smith's remote access to ENT-ADDC-001 be "
+        "blocked.",
+        "No, this request can't be actioned right now. All access modifications "
+        "are on hold pending the current review cycle, so I'm unable to approve "
+        "it at this time.",
+    ),
+    (
+        "We are requesting that Diana Smith's account be disabled.",
+        "No. Account actions like this are on hold under the current change "
+        "freeze until the owner signs off, so I can't authorize disabling it "
+        "right now.",
+    ),
+    (
+        "is there a vulnerability scan available for 10.1.15 subnet? If not, "
+        "we would like permission to scan that subnet.",
+        "No. Right now we're holding on new tasking of that kind until the "
+        "current review cycle closes out, so I can't authorize that scan at "
+        "this time.",
+    ),
+)
+
 EDGE_BLOCK = "can we block 198.51.100.7 at the edge"
 
 INCIDENT_REPLIES = (
@@ -157,6 +210,59 @@ def test_template_structure_is_not_range_vocabulary():
     assert "element" not in vocabulary
 
 
+def test_headings_in_capitals_are_words_not_range_names():
+    """The 2026-10-27 run. A word the range material also writes in plain
+    lowercase is prose set in capitals for a heading, not a name; and the
+    words the ruling prompt asks for ("sign-off") are never range terms. The
+    names that matter must still be caught in the same document, including
+    ones it also writes in lowercase: in a command ("psexec", "wheartland"),
+    a zone file ("hades IN A"), or as part of a host ("atlas" of DC-ATLAS),
+    even when the name is an English word."""
+    false_positives = withheld(OCTOBER_DRAFTS, CAPS_VOCAB)
+    assert not false_positives, false_positives
+    question = "can we restart the print spooler"
+    names = (
+        "DC-VULCAN", "svc-vulcan-backup", "WS01", "VULCAN", "psexec",
+        "wheartland", "atlas", "hades",
+    )
+    misses = missed(
+        [
+            (question, f"Approved. Keep {term} reachable while you do it.")
+            for term in names
+        ],
+        CAPS_VOCAB,
+    )
+    assert not misses, misses
+
+
+def test_an_unusable_word_list_withholds_more_never_less(monkeypatch):
+    """Missing, corrupt, undecodable, or empty: every heading stays a range
+    term, so the screen withholds more replies. It never raises, which would
+    stop the bot starting with nothing but a traceback to show for it."""
+    import gzip
+
+    from rangecontrol.advisor import screen
+
+    def missing():
+        raise FileNotFoundError("gone")
+
+    broken = {
+        "missing": missing,
+        "not gzip": lambda: b"not a gzip stream",
+        "truncated": lambda: gzip.compress(b"right\ntime\n")[:12],
+        "not ascii": lambda: gzip.compress("riöht\n".encode("utf-8")),
+        "empty": lambda: gzip.compress(b""),
+    }
+    # The bundled list makes LOGGED a heading; only the list can do that.
+    assert "logged" not in CAPS_VOCAB
+    lenient = []
+    for name, reader in broken.items():
+        monkeypatch.setattr(screen, "_read_word_list", reader)
+        if "logged" not in range_vocabulary(CAPS_RANGE_MD):
+            lenient.append(name)
+    assert not lenient, lenient
+
+
 def test_echo_is_by_word_not_by_substring():
     """An asker who wrote "alphabet.example" has not licensed "ALPHA"."""
     vocabulary = range_vocabulary("ALPHA is the staging tag.")
@@ -200,10 +306,12 @@ def test_any_address_the_asker_did_not_give_is_caught():
 
 
 def test_every_fallback_reply_passes_the_screen_itself():
-    """A fallback the screen would reject is a fallback that leaks."""
-    rejected = withheld(
-        [("", reply) for reply in SCREENED_APPROVALS + SCREENED_DENIALS], VOCAB
-    )
+    """A fallback the screen would reject is a fallback that leaks. Checked
+    against a capitals-heavy range too: on 2026-10-27 the real corpus put
+    "approved", "apply", and "sign-off" in the vocabulary, and the fallbacks
+    themselves failed."""
+    fallbacks = [("", reply) for reply in SCREENED_APPROVALS + SCREENED_DENIALS]
+    rejected = {**withheld(fallbacks, VOCAB), **withheld(fallbacks, CAPS_VOCAB)}
     assert not rejected, rejected
 
 
